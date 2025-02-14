@@ -95,6 +95,13 @@ constant_relations_cache = {}
 
 # ================================================================================================================
 
+# Python logical shift right
+
+def LShr(x, k, m):
+  return ((x % (m + 1)) >> k) & m
+
+# ================================================================================================================
+
 # AST node
 
 class Node:
@@ -486,7 +493,7 @@ class ShrW(WordBinaryOperation):
   def evaluate(self, values, mask):
     c0 = self.children[0].evaluate(values, mask)
     c1 = self.children[1].evaluate(values, mask)
-    result = (c0 >> c1) & mask
+    result = LShr(c0, c1, mask)
     return result
 
   def as_exp(self, variables, cache):
@@ -1080,7 +1087,7 @@ def evaluate_rpn(rpn, values, mask):
     elif c == '>':
       op0 = stack.pop()
       op1 = stack.pop()
-      stack.append((op1 >> op0) & mask)
+      stack.append(LShr(op1, op0, mask) & mask)
     elif c == '~':
       op0 = stack.pop()
       stack.append((~op0) & mask)
@@ -1175,7 +1182,7 @@ def rpn_to_z3(rpn, z3_variables, size):
     elif c == '>':
       op0 = stack.pop()
       op1 = stack.pop()
-      stack.append(op1 >> op0)
+      stack.append(LShR(op1, op0))
     elif c == '~':
       op0 = stack.pop()
       stack.append(~op0)
@@ -1616,11 +1623,11 @@ class NodeQSynthWeight:
           if self.translate and (not use_cache):
             z3_plain = z3_v0_plain << z3_v1_plain
         elif enode.key == 'ShrW':
-          outputs.append((v0 >> v1) & self.mask)
+          outputs.append(LShr(v0, v1, self.mask))
           if self.translate:
-            z3_node = z3_v0 >> z3_v1
+            z3_node = LShR(z3_v0, z3_v1)
           if self.translate and (not use_cache):
-            z3_plain = z3_v0_plain >> z3_v1_plain
+            z3_plain = LShR(z3_v0_plain, z3_v1_plain)
       elif enode.key in ['NotW', 'NegW']:
         # Obtain the id
         id0 = enode.children[0]
@@ -1908,11 +1915,11 @@ class NodeQSynthWeight:
           if self.translate and (not use_cache):
             z3_plain = z3_v0_plain << z3_v1_plain
         elif enode.key == 'ShrW':
-          outputs.append((v0 >> v1) & self.mask)
+          outputs.append(LShr(v0, v1, self.mask))
           if self.translate:
-            z3_node = z3_v0 >> z3_v1
+            z3_node = LShR(z3_v0, z3_v1)
           if self.translate and (not use_cache):
-            z3_plain = z3_v0_plain >> z3_v1_plain
+            z3_plain = LShR(z3_v0_plain, z3_v1_plain)
       elif enode.key in ['NotW', 'NegW']:
         # Obtain the id
         id0 = enode.children[0]
@@ -39281,13 +39288,13 @@ if __name__ == '__main__':
 
   # ==================== January 2025 ====================
 
-  # v17 = x # unknown definition
-  # v19 = 0x5531EBCC
-  # v21 = v17 ^ (0x147363F3 - (v17 >> 30)) ^ 0x147363F3
-  # v22 = (0x6C078965 * v21) ^ 0x3B3F9FDF
-  # v23 = (0xD80F12CA * v21) & 0x767F3FBE
-  # expression = i + v22 + v23 - 0x3B3F9FDE
-  # simplified = ((((x^(0x147363f3-(x>>30)))^0x147363f3)*0x6c078965)+(i+1))
+  v17 = x # unknown definition
+  v19 = 0x5531EBCC
+  v21 = v17 ^ (0x147363F3 - (v17 >> 30)) ^ 0x147363F3
+  v22 = (0x6C078965 * v21) ^ 0x3B3F9FDF
+  v23 = (0xD80F12CA * v21) & 0x767F3FBE
+  expression = i + v22 + v23 - 0x3B3F9FDE
+  # simplified = ((((x^(x>>0x1e))*0x6c078965)+i)+0x1)
 
   # expression = 0x23a042fd9e47e6fc + (0x48a89296530802e7 + x - (2 * x & 0xd891ab27e29fd3c6))
 
