@@ -37,6 +37,9 @@ import gc
 # - after simplification group all the symbolic variables that appear next to other symbolic variables to reduce the total amount of variables (BITWISE-EXAMPLE)
 # - apply SiMBA on pure symbolic expressions using only boolean operations (as QMC or ESPRESSO or sympy)
 # - apply the Groebner Bases boolean minimization approach on boolean subtrees (https://github.com/cispa/Microarchitectural-Hash-Function-Recovery/)
+# - remove the 'associativity' and 'commutativity' rewrite rules and instead apply a step to bring nodes with same variables closer together
+# - evaluate bit-slices (like MSiMBA) when searching for dead variables in addition to the random evaluation and z3 + unknown=unsat
+# - isolate linear subexpressions from non-linear sub-expressions when part of an ADD/SUB chain
 # =================================================================================================================================================================
 
 '''
@@ -102,6 +105,410 @@ def LShr(x, k, m):
 
 # ================================================================================================================
 
+class KnownBits:
+
+  def __init__(self, size, zero = 0, one = 0):
+    # Assert 'zero' and 'one' to be exclusive
+    if (zero & one) != 0:
+      print(f"KnownBits 'zero' and 'one' should be exclusive: {{ zero: {bin(zero)}, one: {bin(one)} }}")
+      exit(1)
+    # Store the important values
+    self._size = size
+    self._zero = zero
+    self._one = one
+
+  @property
+  def zero(self):
+    return self._zero
+
+  @zero.setter
+  def zero(self, value):
+    self._zero = value
+
+  @property
+  def one(self):
+    return self._one
+
+  @one.setter
+  def one(self, value):
+    self._one = value
+
+  @property
+  def unknown(self):
+    unknown = 0
+    for i in range(self._size):
+      index = 1 << i
+      if (self._zero & index) or (self._one & index):
+        continue
+      unknown |= index
+    return unknown
+
+  @property
+  def size(self):
+    return self._size
+
+  @property
+  def mask(self):
+    return (1 << self.size) - 1
+
+  @property
+  def sign_index(self):
+    return self.size - 1
+
+  def hasConflict(self):
+    return (self.zero & self.one) != 0
+
+  def isConstant(self):
+    return self.unknown == 0
+
+  def getConstant(self):
+    assert self.isConstant()
+    return self.one
+
+  def isUnknown(self):
+    return (not self.zero) and (not self.one)
+
+  def isSignUnknown(self):
+    return (not (self.zero >> self.sign_index)) and (not (self.one >> self.sign_index))
+
+  def resetAll(self):
+    self.zero = 0
+    self.one = 0
+
+  def isZero(self):
+    return self.zero == self.mask
+
+  def isAllOnes(self):
+    return self.one == self.mask
+
+  def setAllZero(self):
+    self.zero = self.mask
+    self.one = 0
+
+  def setAllOne(self):
+    self.zero = 0
+    self.one = self.mask
+
+  def isNegative(self):
+    return self.one >> self.sign_index
+
+  def isNonNegative(self):
+    return self.zero >> self.sign_index
+
+  def isNonZero(self):
+    return not self.isZero()
+
+  def isStrictlyPositive(self):
+    return self.isNonNegative() and self.isNonZero()
+
+  def makeNegative(self):
+    self.one |= (1 << self.sign_index)
+
+  def makeNonNegative(self):
+    self.zero |= (1 << self.sign_index)
+
+  def getMinValue(self):
+    return self.one
+
+  def getSignedMinValue(self):
+    minValue = self.getMinValue()
+    if (self.zero >> self.sign_index) == 0:
+      minValue |= (1 << self.sign_index)
+    return minValue
+
+  def getMaxValue(self):
+    return (~self.zero) & self.mask
+
+  def getSignedMaxValue(self):
+    maxValue = self.getMaxValue()
+    if (self.one >> self.sign_index) == 0:
+      maxValue &= ((1 << self.sign_index) - 1)
+    return maxValue
+
+  @staticmethod
+  def _countr_one(size, value):
+    count = 0
+    for i in range(size):
+      if (value & (1 << i)) == 1:
+        count += 1
+      else:
+        break
+    return count
+
+  @staticmethod
+  def _countr_zero(size, value):
+    count = 0
+    for i in range(size):
+      if (value & (1 << i)) == 0:
+        count += 1
+      else:
+        break
+    return count
+
+  @staticmethod
+  def _countl_one(size, value):
+    count = 0
+    for i in range(size - 1, -1, -1):
+      if (value & (1 << i)) == 1:
+        count += 1
+      else:
+        break
+    return count
+
+  @staticmethod
+  def _countl_zero(size, value):
+    count = 0
+    for i in range(size - 1, -1, -1):
+      if (value & (1 << i)) == 0:
+        count += 1
+      else:
+        break
+    return count
+
+  def countMinTrailingZeros(self):
+    return KnownBits._countr_one(self.size, self.zero)
+
+  def countMinTrailingOnes(self):
+    return KnownBits._countr_one(self.size, self.one)
+
+  def countMinLeadingZeros(self):
+    return KnownBits._countl_one(self.size, self.zero)
+
+  def countMinLeadingOnes(self):
+    return KnownBits._countl_one(self.size, self.one)
+
+  @staticmethod
+  def makeConstant(size, value):
+    zero = (~value) & ((1 << size) - 1)
+    one = value
+    return KnownBits(size, zero, one)
+
+  @staticmethod
+  def makeVariable(size):
+    return KnownBits(size)
+
+  def intersectWith(self, other):
+    assert self.size == other.size
+    return KnownBits(self.size, self.zero & other.zero, self.one & other.one)
+
+  def unionWith(self, other):
+    assert self.size == other.size
+    return KnownBits(self.size, self.zero | other.zero, self.one | other.one)
+
+  def haveNoCommonBitsSet(self, other):
+    assert self.size == other.size
+    return (self.zero | other.zero) == self.mask
+
+  def equals(self, other):
+    assert self.size == other.size
+    return (self.zero == other.zero) and (self.one == other.one)
+
+  @staticmethod
+  def computeForAddCarry(lhs, rhs, carry_zero, carry_one):
+    possibleSumZero = lhs.getMaxValue() + rhs.getMaxValue() + int(not carry_zero)
+    possibleSumOne = lhs.getMinValue() + rhs.getMinValue() + int(carry_one)
+    # Compute known bits of the carry.
+    carryKnownZero = ~(possibleSumZero ^ lhs.zero ^ rhs.zero) & lhs.mask
+    carryKnownOne = possibleSumOne ^ lhs.one ^ rhs.one
+    # Compute set of known bits (where all three relevant bits are known).
+    lhsKnownUnion = lhs.zero | lhs.one
+    rhsKnownUnion = rhs.zero | rhs.one
+    carryKnownUnion = carryKnownZero | carryKnownOne
+    known = lhsKnownUnion & rhsKnownUnion & carryKnownUnion
+    # Compute known bits of the result.
+    knownOut = KnownBits(lhs.size)
+    knownOut.zero = ((~possibleSumZero) & lhs.mask) & known
+    knownOut.one = possibleSumOne & known
+    return knownOut
+
+  @staticmethod
+  def computeForAddSub(add, lhs, rhs):
+    bitWidth = lhs.size
+    knownOut = KnownBits(bitWidth)
+    if (not lhs.isUnknown()) and (not rhs.isUnknown()):
+      if add:
+        # Sum = LHS + RHS + 0
+        knownOut = KnownBits.computeForAddCarry(lhs, rhs, True, False)
+      else:
+        # Sum = LHS + ~RHS + 1
+        knownOut = KnownBits.computeForAddCarry(lhs, ~rhs, False, True)
+    assert not knownOut.hasConflict()
+    return knownOut
+
+  def __repr__(self):
+    representation = ""
+    for i in range(self._size - 1, -1, -1):
+      bit_index = 1 << i
+      if self._zero & bit_index:
+        representation += "0"
+      elif self._one & bit_index:
+        representation += "1"
+      else:
+        representation += "?"
+    return representation
+
+  def __add__(self, other):
+    if isinstance(other, int):
+      other = KnownBits.makeConstant(self.size, other)
+    assert self.size == other.size
+    return KnownBits.computeForAddSub(True, self, other)
+
+  def __sub__(self, other):
+    if isinstance(other, int):
+      other = KnownBits.makeConstant(self.size, other)
+    assert self.size == other.size
+    return KnownBits.computeForAddSub(False, self, other)
+
+  @staticmethod
+  def _isNegative(size, value):
+    return ((value >> (size - 1)) & 1) == 1
+
+  @staticmethod
+  def _ult(lhs_size, lhs, rhs_size, rhs):
+    assert lhs_size == rhs_size
+    # TODO: Verify if this is true in Python
+    return lhs < rhs
+
+  @staticmethod
+  def _umul_ov(lhs_size, lhs, rhs_size, rhs):
+    # Obtain the mask and result size
+    mask = (1 << lhs_size) - 1
+    res_size = lhs_size
+    # Logic copied for APInt::umul_ov
+    lhs_lz = KnownBits._countl_zero(lhs_size, lhs)
+    rhs_lz = KnownBits._countl_zero(rhs_size, rhs)
+    if ((lhs_lz + rhs_lz + 2) <= lhs_size):
+      return (lhs * rhs) & mask, True
+    res = (LShr(lhs, 1) * rhs) & mask
+    overflow = KnownBits._isNegative(res_size, res)
+    res <<= 1
+    if (lhs & 1) == 1:
+      res = (res + rhs) & mask
+      if KnownBits._ult(res_size, res, rhs_size, rhs):
+        overflow = True
+    return res, overflow
+
+  def __mul__(self, other):
+    assert self.size == other.size
+    LHS = self
+    RHS = other
+    bitWidth = LHS.size
+    # Compute the high known-0 bits by multiplying the unsigned max of each side.
+    # Conservatively, M active bits * N active bits results in M + N bits in the
+    # result. But if we know a value is a power-of-2 for example, then this
+    # computes one more leading zero.
+    UMaxLHS = LHS.getMaxValue()
+    UMaxRHS = RHS.getMaxValue()
+    # For leading zeros in the result to be valid, the unsigned max product must
+    # fit in the bitwidth (it must not overflow).
+    UMaxResult, HasOverflow = KnownBits._umul_ov(LHS.size, UMaxLHS, RHS.size, UMaxRHS)
+    LeadZ = 0 if HasOverflow else KnownBits._countl_zero(LHS.size, UMaxResult)
+    # The result of the bottom bits of an integer multiply can be
+    # inferred by looking at the bottom bits of both operands and
+    # multiplying them together.
+    # We can infer at least the minimum number of known trailing bits
+    # of both operands. Depending on number of trailing zeros, we can
+    # infer more bits, because (a*b) <=> ((a/m) * (b/n)) * (m*n) assuming
+    # a and b are divisible by m and n respectively.
+    # We then calculate how many of those bits are inferrable and set
+    # the output. For example, the i8 mul:
+    #  a = XXXX1100 (12)
+    #  b = XXXX1110 (14)
+    # We know the bottom 3 bits are zero since the first can be divided by
+    # 4 and the second by 2, thus having ((12/4) * (14/2)) * (2*4).
+    # Applying the multiplication to the trimmed arguments gets:
+    #    XX11 (3)
+    #    X111 (7)
+    # -------
+    #    XX11
+    #   XX11
+    #  XX11
+    # XX11
+    # -------
+    # XXXXX01
+    # Which allows us to infer the 2 LSBs. Since we're multiplying the result
+    # by 8, the bottom 3 bits will be 0, so we can infer a total of 5 bits.
+    # The proof for this can be described as:
+    # Pre: (C1 >= 0) && (C1 < (1 << C5)) && (C2 >= 0) && (C2 < (1 << C6)) &&
+    #      (C7 == (1 << (umin(countTrailingZeros(C1), C5) +
+    #                    umin(countTrailingZeros(C2), C6) +
+    #                    umin(C5 - umin(countTrailingZeros(C1), C5),
+    #                         C6 - umin(countTrailingZeros(C2), C6)))) - 1)
+    # %aa = shl i8 %a, C5
+    # %bb = shl i8 %b, C6
+    # %aaa = or i8 %aa, C1
+    # %bbb = or i8 %bb, C2
+    # %mul = mul i8 %aaa, %bbb
+    # %mask = and i8 %mul, C7
+    #   =>
+    # %mask = i8 ((C1*C2)&C7)
+    # Where C5, C6 describe the known bits of %a, %b
+    # C1, C2 describe the known bottom bits of %a, %b.
+    # C7 describes the mask of the known bits of the result.
+    Bottom0 = LHS.one
+    Bottom1 = RHS.one
+    # How many times we'd be able to divide each argument by 2 (shr by 1).
+    # This gives us the number of trailing zeros on the multiplication result.
+    TrailBitsKnown0 = KnownBits._countr_one(LHS.size, LHS.zero | LHS.one)
+    TrailBitsKnown1 = KnownBits._countr_one(RHS.size, RHS.zero | RHS.one)
+    TrailZero0 = LHS.countMinTrailingZeros()
+    TrailZero1 = RHS.countMinTrailingZeros()
+    TrailZ = TrailZero0 + TrailZero1
+    # Figure out the fewest known-bits operand.
+    SmallestOperand = min(TrailBitsKnown0 - TrailZero0, TrailBitsKnown1 - TrailZero1)
+    ResultBitsKnown = min(SmallestOperand + TrailZ, BitWidth)
+
+    r = KnownBits(self.size)
+    return r
+
+  def __and__(self, other):
+    assert self.size == other.size
+    r = KnownBits(self.size)
+    # Result bit is 0 if either operand bit is 0.
+    r.zero = self.zero | other.zero
+    # Result bit is 1 if both operand bits are 1.
+    r.one = self.one & other.one
+    return r
+
+  def __or__(self, other):
+    assert self.size == other.size
+    r = KnownBits(self.size)
+    # Result bit is 0 if both operand bits are 0.
+    r.zero = self.zero & other.zero
+    # Result bit is 1 if either operand bit is 1.
+    r.one = self.one | other.one
+    return r
+
+  def __xor__(self, other):
+    if isinstance(other, int):
+      other = KnownBits.makeConstant(self.size, other)
+    assert self.size == other.size
+    r = KnownBits(self.size)
+    # Result bit is 0 if both operand bits are 0 or both are 1.
+    r.zero = (self.zero & other.zero) | (self.one & other.one)
+    # Result bit is 1 if one operand bit is 0 and the other is 1.
+    r.one = (self.zero & other.one) | (self.one & other.zero)
+    return r
+
+  def __invert__(self):
+    # NOT = swap(LHS.zero, LHS.one)
+    return KnownBits(self.size, self.one, self.zero)
+
+  def __neg__(self):
+    # Neg = 0 - LHS
+    o = KnownBits.makeConstant(self.size, 0)
+    return o - self
+
+  def __lshift__(self, other):
+    r = KnownBits(self.size)
+    return r
+
+  def __rshift__(self, other):
+    r = KnownBits(self.size)
+    return r
+
+# ================================================================================================================
+
 # AST node
 
 class Node:
@@ -128,6 +535,47 @@ class Node:
       return f'{tag}{self.key}({", ".join(str(child) for child in self.children)})'
     else:
       return f'{tag}{self.key}'
+
+  def duplicate(self):
+    if len(self.children) == 2:
+      match self.key:
+        case 'AddW':
+          return self.children[0].duplicate() + self.children[1].duplicate()
+        case 'SubW':
+          return self.children[0].duplicate() - self.children[1].duplicate()
+        case 'MulW':
+          return self.children[0].duplicate() * self.children[1].duplicate()
+        case 'AndW':
+          return self.children[0].duplicate() & self.children[1].duplicate()
+        case 'XorW':
+          return self.children[0].duplicate() ^ self.children[1].duplicate()
+        case 'OrW':
+          return self.children[0].duplicate() | self.children[1].duplicate()
+        case 'ShlW':
+          return self.children[0].duplicate() << self.children[1].duplicate()
+        case 'ShrW':
+          return self.children[0].duplicate() >> self.children[1].duplicate()
+        case _:
+          print(f"Node::duplicate: unsupported node '{self.key}'")
+          exit(1)
+    elif len(self.children) == 1:
+      match self.key:
+        case 'NegW':
+          return -self.children[0].duplicate()
+        case 'NotW':
+          return ~self.children[0].duplicate()
+        case _:
+          print(f"Node::duplicate: unsupported node '{self.key}'")
+          exit(1)
+    elif self.key.startswith('WV_'):
+      value = self.key.replace('WV_', '')
+      return WordVariable(value)
+    elif self.key.startswith('K_'):
+      number = int(self.key.replace('K_', ''), 16)
+      return WordConstant(number)
+    else:
+      print(f"Node::duplicate: unsupported node '{self.key}'")
+      exit(1)
 
   def to_rpn(self):
     operations = {
@@ -340,6 +788,9 @@ class WordVariable(WordNode):
   def evaluate(self, values, mask):
     name = self.key.replace('WV_', '')
     return values[name] & mask
+
+  def knownBits(self):
+    pass
 
   def as_exp(self, variables, cache):
     name = self.key.replace('WV_', '')
@@ -3252,13 +3703,15 @@ def load_oracle(path, use_constants=False):
 # ================================================================================================================
 
 def strip_opaque_variables_internal(expression, verify, bits, samples):
+  global Z3_TIMEOUT
+  global TREAT_UNKNOWN_AS_UNSAT
   did_update = False
   # Clone the original expression
-  original = copy.deepcopy(expression)
+  original = expression.duplicate()
   # Compute the bit mask
   mask = 2**bits-1
   # Collect the used variables
-  worklist = [ expression ]
+  worklist = [ original ]
   known = set()
   variables = set()
   while worklist:
@@ -3304,10 +3757,9 @@ def strip_opaque_variables_internal(expression, verify, bits, samples):
     if not different:
       opaque.add(v)
   # Replace the opaque variables with a zero constant
-  updated = expression
+  updated = original
   if opaque:
-    print(f'Possibly opaque variable(s) found: {opaque}')
-    worklist = [ (False, expression) ]
+    worklist = [ (False, original) ]
     known = set()
     nodes = {}
     while worklist:
@@ -3327,15 +3779,38 @@ def strip_opaque_variables_internal(expression, verify, bits, samples):
           worklist.append((False, child))
     # Verify the correctness with z3
     if verify:
+      # Verify via full bit-width
       symbolic_variables = {}
       for v in variables:
         symbolic_variables[v] = BitVec(v, bits)
-      rpn_0 = original.to_rpn()
+      rpn_0 = expression.to_rpn()
       rpn_1 = updated.to_rpn()
       z3_0 = rpn_to_z3(rpn_0, symbolic_variables, bits)
       z3_1 = rpn_to_z3(rpn_1, symbolic_variables, bits)
-      if opaque and not is_equivalent(z3_0, z3_1):
-        return did_update, original
+      equivalent = is_equivalent(z3_0, z3_1)
+      # Verify via 8 bits bit-width
+      if opaque and equivalent:
+        bits = 8
+        symbolic_variables = {}
+        for v in variables:
+          symbolic_variables[v] = BitVec(v, bits)
+        rpn_0 = expression.to_rpn()
+        rpn_1 = updated.to_rpn()
+        z3_0 = rpn_to_z3(rpn_0, symbolic_variables, bits)
+        z3_1 = rpn_to_z3(rpn_1, symbolic_variables, bits)
+        old_TUAU = TREAT_UNKNOWN_AS_UNSAT
+        old_ZT = Z3_TIMEOUT
+        TREAT_UNKNOWN_AS_UNSAT = False
+        Z3_TIMEOUT = 60000 # use 60 seconds with 8 bits variables
+        equivalent = is_equivalent(z3_0, z3_1)
+        TREAT_UNKNOWN_AS_UNSAT = old_TUAU
+        Z3_TIMEOUT = old_ZT
+      # Check if we need to bail out
+      if opaque:
+        if not equivalent:
+          return did_update, expression
+    # Debug log
+    print(f'Possibly opaque variable(s) found: {opaque}')
   # Return the updated expression
   return did_update, updated
 
@@ -3815,7 +4290,7 @@ def update_oracle_with_harvested_constants_old(oracle, constants, expressions, m
   # Debug print the amount of new entries
   print(f"Expanded: {new_entries}")
 
-def update_oracle_with_harvested_constants(oracle, constants, expressions, mask, bits, constants_computation_cahce, negate=False, heavy=False):
+def update_oracle_with_harvested_constants(oracle, constants, expressions, mask, bits, constants_computation_cahce, negate=False, heavy=False, verify=False):
   # Count the amount of added entries
   new_entries = 0
   # Combine the expressions between each other
@@ -3824,6 +4299,10 @@ def update_oracle_with_harvested_constants(oracle, constants, expressions, mask,
     variables = set()
     for expression in expressions.values():
       variables = variables.union(expression.get_variables())
+    # Get the z3 variables
+    z3_variables = {}
+    for v in variables:
+      z3_variables[v] = BitVec(v, bits)
     # Compute random inputs for the variables
     inputs = list()
     for i in range(INPUTS_AMOUNT):
@@ -3856,12 +4335,17 @@ def update_oracle_with_harvested_constants(oracle, constants, expressions, mask,
       elif temp_oracle[key][0] > cost:
         # Fetch the old information
         old_cost, old_eid, old_exp = temp_oracle[key]
-        # Union the e-classes
-        egraph.union(eid, old_eid)
-        # Update the temporary oracle
-        temp_oracle[key] = (cost, eid, exp)
-        # Debug dump the improvement
-        # print(f"(0) CostOld: {old_cost}, RPNOld: {old_exp.to_exp()} => CostNew: {cost}, RPNNew: {exp.to_exp()}")
+        # Verify the correctness
+        if verify:
+          i_z3 = rpn_to_z3(exp.to_rpn(), z3_variables, bits)
+          o_z3 = rpn_to_z3(old_exp.to_rpn(), z3_variables, bits)
+        if (not verify) or is_equivalent(i_z3, o_z3):
+          # Union the e-classes
+          egraph.union(eid, old_eid)
+          # Update the temporary oracle
+          temp_oracle[key] = (cost, eid, exp)
+          # Debug dump the improvement
+          # print(f"(0) CostOld: {old_cost}, RPNOld: {old_exp.to_exp()} => CostNew: {cost}, RPNNew: {exp.to_exp()}")
       # Store the expression evaluation
       evaluations.append((eid, exp, cost, outputs))
     # Combine the collected expressions (rpn0 op rpn1)
@@ -3910,13 +4394,18 @@ def update_oracle_with_harvested_constants(oracle, constants, expressions, mask,
                 new_exp ^= expression1
               elif op == '|':
                 new_exp |= expression1
-              # Add the expression to the e-graph
-              new_eid = egraph.add_instantiation(new_exp, {})
-              egraph.union(new_eid, old_eid)
-              # Update the temporary oracle
-              temp_oracle[key] = (new_cost, new_eid, new_exp)
-              # Debug dump the improvement
-              # print(f"(1) CostOld: {old_cost}, RPNOld: {old_exp.to_exp()} => CostNew: {new_cost}, RPNNew: {new_exp.to_exp()}")
+              # Verify the correctness
+              if verify:
+                i_z3 = rpn_to_z3(new_exp.to_rpn(), z3_variables, bits)
+                o_z3 = rpn_to_z3(old_exp.to_rpn(), z3_variables, bits)
+              if (not verify) or is_equivalent(i_z3, o_z3):
+                # Add the expression to the e-graph
+                new_eid = egraph.add_instantiation(new_exp, {})
+                egraph.union(new_eid, old_eid)
+                # Update the temporary oracle
+                temp_oracle[key] = (new_cost, new_eid, new_exp)
+                # Debug dump the improvement
+                # print(f"(1) CostOld: {old_cost}, RPNOld: {old_exp.to_exp()} => CostNew: {new_cost}, RPNNew: {new_exp.to_exp()}")
     # Rebuild the e-graph
     egraph.rebuild()
     extractor.update_costs(node)
@@ -37546,15 +38035,15 @@ class SiMBA:
 
 def minimize_constants(constants, excluded, included, vars_count, bits_count):
 
+  # Bail out if the set of constants is empty
+  if len(constants) == 0:
+    return None, None
+
   # Clone the constants
   constants = copy.deepcopy(constants)
 
   # Compute the mask
   mask = (1 << bits_count) - 1
-
-  # Bail out if the set of constants is empty
-  if len(constants) == 0:
-    return None, None
 
   # Return a symbolic variable if we have a single constant
   if len(constants) == 1:
@@ -37588,7 +38077,7 @@ def minimize_constants(constants, excluded, included, vars_count, bits_count):
 
   # Define a solver
   solver = Then('simplify', 'bit-blast', 'sat').solver()
-  solver.set('timeout', 500)
+  solver.set('timeout', 100)
 
   # Create the truth table flags, to understand if we need a term or not
   truth_tables = []
@@ -37810,7 +38299,7 @@ def replace_constants_with_variables(expression, bit_count):
   else:
     # Otherwise attempt rewriting the constants
     # for vars_count in [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ]:
-    for vars_count in [ 1, 2, 3  ]:
+    for vars_count in [ 1, 2, 3, 4, 5 ]:
       # In the worst case we replace each constant with one variable
       if vars_count <= len(input_constants):
         replacements, variables = minimize_constants(input_constants, [], [], vars_count, bit_count)
@@ -38982,6 +39471,7 @@ if __name__ == '__main__':
   # expression = (((x^y)*-3751285467811676160)+((((x*y)*(x*y))*7439751665915265024)+(((x|y)*(((x*y)*1392593702064488448)+(928395801376325632*(x|y))))+((((x^y)*-8527075185822531584)*(x*y))+(((x^y)*((928395801376325632*(x|y))+(-8991273086510694400*(x^y))))+(1567872932321951744+(((x*y)*-6507636315486420992)+(((x|y)*3620980961824473088)+(((x^y)*1810490480912236544)+((7357730074168131584+((((-928395801376325632*(x|y))*((x|y)+(x^y)))+(((x*y)*(((x^y)*8527075185822531584)+2911192480349159427))+((x^y)*((8991273086510694400*(x^y))+1940794986899439618))))+((x|y)*3881589973798879236)))+((x*y)*((-7439751665915265024*(x*y))+((x|y)*-1392593702064488448)))))))))))))
   # expression = (((x^y)*0xcbf0c1be00000000)+((((0x15c2342000000000-((x*y)*-0xa5b03b4000000000))+(((x^y)*0x1920278000000000)+(((x|y)*0x681e7c8400000004)+0x661be88500000000)))+(0x2866a22300000003*(x*y)))+(0x1aef16c200000002*(x^y))))
   # expression = ((((x^y)*0x2)+(0x7bde1ca500000000+((x|y)*0x681e7c8400000004)))+((x*y)*0xce16dd6300000003))
+  # expression = ((((x|y)*0x4)+((x^y)*0x2))+(x*(0x3*y)))
 
   # expression = 2283507124140018737*(x^y) + 4*(x|y) + 3*(x*y) + 2958762391363387392*((x^y)**2) + 16718719988537491456*(x^y)*(x|y) + 12539039991403118592*(x^y)*(x*y) + 10970130550328655872*((x^y)**3) + 14845256405073526784*((x^y)**2)*(x|y) + 11133942303805145088*((x^y)**2)*(x*y) + 1897113923958603776*(x^y)*((x|y)**2) + 12069042922792681472*(x^y)*(x|y)*(x*y) + 2220048086833561600*(x^y)*((x*y)**2) + 17310096213072150528*((x^y)**4) + 415080139295031296*((x^y)**3)*(x|y) + 9534682141326049280*((x^y)**3)*(x*y) + 9739994755034513408*((x^y)**2)*((x|y)**2) + 14609992132551770112*((x^y)**2)*(x|y)*(x*y) + 12396276077347995648*((x^y)**2)*((x*y)**2) + 16116365462522036224*(x^y)*((x|y)**3) + 8591706180110254080*(x^y)*((x|y)**2)*(x*y) + 11055465653510078464*(x^y)*(x|y)*((x*y)**2) + 11987238450232295424*(x^y)*((x*y)**3) + 8353800249298386944*((x^y)**5) + 9987104719157329920*((x^y)**4)*(x|y) + 12102014557795385344*((x^y)**4)*(x*y) + 4277255950382923776*((x^y)**3)*((x|y)**2) + 6415883925574385664*((x^y)**3)*(x|y)*(x*y) + 7017642490517782528*((x^y)**3)*((x*y)**2) + 18189063078379782144*((x^y)**2)*((x|y)**3) + 13255275815790182400*((x^y)**2)*((x|y)**2)*(x*y) + 5329770843415248896*((x^y)**2)*(x|y)*((x*y)**2) + 15167500766135975936*((x^y)**2)*((x*y)**3) + 14195815516936863744*(x^y)*((x|y)**4) + 5693958403391488000*(x^y)*((x|y)**3)*(x*y) + 8711546213029117952*(x^y)*((x|y)**2)*((x*y)**2) + 13579145143369334784*(x^y)*(x|y)*((x*y)**3) + 10616540246629679104*(x^y)*((x*y)**4) + 2283507124140018735*x + 16163236949569532881*y + 13879729825429514146*(~(~x|y)) + 16004908862167580672*(x^y)*x + 2441835211541970944*(x^y)*y + 4883670423083941888*(x^y)*(~(~x|y)) + 16718719988537491456*(x|y)*x + 1728024085172060160*(x|y)*y + 3456048170344120320*(x|y)*(~(~x|y)) + 12539039991403118592*(x*y)*x + 5907704082306433024*(x*y)*y + 11815408164612866048*(x*y)*(~(~x|y)) + 13046146470804193280*(x**2) + 10801195205810716672*x*y + 3155646337911881728*x*(~(~x|y)) + 13046146470804193280*(y**2) + 15291097735797669888*y*(~(~x|y)) + 15291097735797669888*((~(~x|y))**2) + 7041019374739652608*((x^y)**2)*x + 11405724698969899008*((x^y)**2)*y + 4364705324230246400*((x^y)**2)*(~(~x|y)) + 9346654812478898176*(x^y)*(x|y)*x + 9100089261230653440*(x^y)*(x|y)*y + 18200178522461306880*(x^y)*(x|y)*(~(~x|y)) + 7009991109359173632*(x^y)*(x*y)*x + 11436752964350377984*(x^y)*(x*y)*y + 4426761854991204352*(x^y)*(x*y)*(~(~x|y)) + 1897113923958603776*((x|y)**2)*x + 16549630149750947840*((x|y)**2)*y + 14652516225792344064*((x|y)**2)*(~(~x|y)) + 12069042922792681472*(x|y)*(x*y)*x + 6377701150916870144*(x|y)*(x*y)*y + 12755402301833740288*(x|y)*(x*y)*(~(~x|y)) + 2220048086833561600*((x*y)**2)*x + 16226695986875990016*((x*y)**2)*y + 14006647900042428416*((x*y)**2)*(~(~x|y)) + 4704355671619928064*(x^y)*(x**2) + 9038032730469695488*(x^y)*x*y + 18076065460939390976*(x^y)*x*(~(~x|y)) + 4704355671619928064*(x^y)*(y**2) + 370678612770160640*(x^y)*y*(~(~x|y)) + 370678612770160640*(x^y)*((~(~x|y))**2) + 12948142481114923008*(x|y)*(x**2) + 10997203185189257216*(x|y)*x*y + 3547662296668962816*(x|y)*x*(~(~x|y)) + 12948142481114923008*(x|y)*(y**2) + 14899081777040588800*(x|y)*y*(~(~x|y)) + 14899081777040588800*(x|y)*((~(~x|y))**2) + 14322792879263580160*(x*y)*(x**2) + 8247902388891942912*(x*y)*x*y + 16495804777783885824*(x*y)*x*(~(~x|y)) + 14322792879263580160*(x*y)*(y**2) + 1950939295925665792*(x*y)*y*(~(~x|y)) + 1950939295925665792*(x*y)*((~(~x|y))**2) + 8633466847208931328*(x**3) + 10993087605792309248*(x**2)*y + 3539431137875066880*(x**2)*(~(~x|y)) + 7453656467917242368*x*(y**2) + 11367881797959417856*x*y*(~(~x|y)) + 11367881797959417856*x*((~(~x|y))**2) + 9813277226500620288*(y**3) + 3539431137875066880*(y**2)*(~(~x|y)) + 7078862275750133760*y*((~(~x|y))**2) + 4719241517166755840*((~(~x|y))**3) + 13692612561512431616*((x^y)**3)*x + 4754131512197120000*((x^y)**3)*y + 9508263024394240000*((x^y)**3)*(~(~x|y)) + 9951989736560132096*((x^y)**2)*(x|y)*x + 8494754337149419520*((x^y)**2)*(x|y)*y + 16989508674298839040*((x^y)**2)*(x|y)*(~(~x|y)) + 12075678320847486976*((x^y)**2)*(x*y)*x + 6371065752862064640*((x^y)**2)*(x*y)*y + 12742131505724129280*((x^y)**2)*(x*y)*(~(~x|y)) + 13752185389995524096*(x^y)*((x|y)**2)*x + 4694558683714027520*(x^y)*((x|y)**2)*y + 9389117367428055040*(x^y)*((x|y)**2)*(~(~x|y)) + 2181534011283734528*(x^y)*(x|y)*(x*y)*x + 16265210062425817088*(x^y)*(x|y)*(x*y)*y + 14083676051142082560*(x^y)*(x|y)*(x*y)*(~(~x|y)) + 818075254231400448*(x^y)*((x*y)**2)*x + 17628668819478151168*(x^y)*((x*y)**2)*y + 16810593565246750720*(x^y)*((x*y)**2)*(~(~x|y)) + 16116365462522036224*((x|y)**3)*x + 2330378611187515392*((x|y)**3)*y + 4660757222375030784*((x|y)**3)*(~(~x|y)) + 8591706180110254080*((x|y)**2)*(x*y)*x + 9855037893599297536*((x|y)**2)*(x*y)*y + 1263331713489043456*((x|y)**2)*(x*y)*(~(~x|y)) + 11055465653510078464*(x|y)*((x*y)**2)*x + 7391278420199473152*(x|y)*((x*y)**2)*y + 14782556840398946304*(x|y)*((x*y)**2)*(~(~x|y)) + 11987238450232295424*((x*y)**3)*x + 6459505623477256192*((x*y)**3)*y + 12919011246954512384*((x*y)**3)*(~(~x|y)) + 4215863352846450688*((x^y)**2)*(x**2) + 10015017368016650240*((x^y)**2)*x*y + 1583290662323748864*((x^y)**2)*x*(~(~x|y)) + 4215863352846450688*((x^y)**2)*(y**2) + 16863453411385802752*((x^y)**2)*y*(~(~x|y)) + 16863453411385802752*((x^y)**2)*((~(~x|y))**2) + 3075897041562370048*(x^y)*(x|y)*(x**2) + 12294949990584811520*(x^y)*(x|y)*x*y + 6143155907460071424*(x^y)*(x|y)*x*(~(~x|y)) + 3075897041562370048*(x^y)*(x|y)*(y**2) + 12303588166249480192*(x^y)*(x|y)*y*(~(~x|y)) + 12303588166249480192*(x^y)*(x|y)*((~(~x|y))**2) + 11530294818026553344*(x^y)*(x*y)*(x**2) + 13832898511365996544*(x^y)*(x*y)*x*y + 9219052949022441472*(x^y)*(x*y)*x*(~(~x|y)) + 11530294818026553344*(x^y)*(x*y)*(y**2) + 9227691124687110144*(x^y)*(x*y)*y*(~(~x|y)) + 9227691124687110144*(x^y)*(x*y)*((~(~x|y))**2) + 4012190634961010688*((x|y)**2)*(x**2) + 10422362803787530240*((x|y)**2)*x*y + 2397981533865508864*((x|y)**2)*x*(~(~x|y)) + 4012190634961010688*((x|y)**2)*(y**2) + 16048762539844042752*((x|y)**2)*y*(~(~x|y)) + 16048762539844042752*((x|y)**2)*((~(~x|y))**2) + 6018285952441516032*(x|y)*(x*y)*(x**2) + 6410172168826519552*(x|y)*(x*y)*x*y + 12820344337653039104*(x|y)*(x*y)*x*(~(~x|y)) + 6018285952441516032*(x|y)*(x*y)*(y**2) + 5626399736056512512*(x|y)*(x*y)*y*(~(~x|y)) + 5626399736056512512*(x|y)*(x*y)*((~(~x|y))**2) + 6868543250592956416*((x*y)**2)*(x**2) + 4709657572523638784*((x*y)**2)*x*y + 9419315145047277568*((x*y)**2)*x*(~(~x|y)) + 6868543250592956416*((x*y)**2)*(y**2) + 9027428928662274048*((x*y)**2)*y*(~(~x|y)) + 9027428928662274048*((x*y)**2)*((~(~x|y))**2) + 2297926061637238784*(x^y)*(x**3) + 11552965888797835264*(x^y)*(x**2)*y + 4659187703886118912*(x^y)*(x**2)*(~(~x|y)) + 6893778184911716352*(x^y)*x*(y**2) + 9128368665937313792*(x^y)*x*y*(~(~x|y)) + 9128368665937313792*(x^y)*x*((~(~x|y))**2) + 16148818012072312832*(x^y)*(y**3) + 4659187703886118912*(x^y)*(y**2)*(~(~x|y)) + 9318375407772237824*(x^y)*y*((~(~x|y))**2) + 63335580611641344*(x^y)*((~(~x|y))**3) + 11985731518006820864*(x|y)*(x**3) + 936293593398640640*(x|y)*(x**2)*y + 1872587186797281280*(x|y)*(x**2)*(~(~x|y)) + 17510450480310910976*(x|y)*x*(y**2) + 14701569700114989056*(x|y)*x*y*(~(~x|y)) + 14701569700114989056*(x|y)*x*((~(~x|y))**2) + 6461012555702730752*(x|y)*(y**3) + 1872587186797281280*(x|y)*(y**2)*(~(~x|y)) + 3745174373594562560*(x|y)*y*((~(~x|y))**2) + 14794612298202742784*(x|y)*((~(~x|y))**3) + 8989298638505115648*(x*y)*(x**3) + 9925592231903756288*(x*y)*(x**2)*y + 1404440390097960960*(x*y)*(x**2)*(~(~x|y)) + 8521151841805795328*(x*y)*x*(y**2) + 15637863293513629696*(x*y)*x*y*(~(~x|y)) + 15637863293513629696*(x*y)*x*((~(~x|y))**2) + 9457445435204435968*(x*y)*(y**3) + 1404440390097960960*(x*y)*(y**2)*(~(~x|y)) + 2808880780195921920*(x*y)*y*((~(~x|y))**2) + 1872587186797281280*(x*y)*((~(~x|y))**3) + 12911323130940620800*(x**4) + 3694939697366171648*(x**3)*y + 7389879394732343296*(x**3)*(~(~x|y)) + 3680962490805518336*(x**2)*(y**2) + 14723849963222073344*(x**2)*y*(~(~x|y)) + 14723849963222073344*(x**2)*((~(~x|y))**2) + 3694939697366171648*x*(y**3) + 3722894110487478272*x*(y**2)*(~(~x|y)) + 7445788220974956544*x*y*((~(~x|y))**2) + 11112773505219821568*x*((~(~x|y))**3) + 12911323130940620800*(y**4) + 11056864678977208320*(y**3)*(~(~x|y)) + 14723849963222073344*(y**2)*((~(~x|y))**2) + 7333970568489730048*y*((~(~x|y))**3) + 3666985284244865024*((~(~x|y))**4) + 9105332776348942336*((x^y)**4)*x + 9341411297360609280*((x^y)**4)*y + 236078521011666944*((x^y)**4)*(~(~x|y)) + 17224418852536844288*((x^y)**3)*(x|y)*x + 1222325221172707328*((x^y)**3)*(x|y)*y + 2444650442345414656*((x^y)**3)*(x|y)*(~(~x|y)) + 8306628120975245312*((x^y)**3)*(x*y)*x + 10140115952734306304*((x^y)**3)*(x*y)*y + 1833487831759060992*((x^y)**3)*(x*y)*(~(~x|y)) + 3994917307288649728*((x^y)**2)*((x|y)**2)*x + 14451826766420901888*((x^y)**2)*((x|y)**2)*y + 10456909459132252160*((x^y)**2)*((x|y)**2)*(~(~x|y)) + 5992375960932974592*((x^y)**2)*(x|y)*(x*y)*x + 12454368112776577024*((x^y)**2)*(x|y)*(x*y)*y + 6461992151843602432*((x^y)**2)*(x|y)*(x*y)*(~(~x|y)) + 9164670012990947328*((x^y)**2)*((x*y)**2)*x + 9282074060718604288*((x^y)**2)*((x*y)**2)*y + 117404047727656960*((x^y)**2)*((x*y)**2)*(~(~x|y)) + 7986495122885836800*(x^y)*((x|y)**3)*x + 10460248950823714816*(x^y)*((x|y)**3)*y + 2473753827937878016*(x^y)*((x|y)**3)*(~(~x|y)) + 8746241989638356992*(x^y)*((x|y)**2)*(x*y)*x + 9700502084071194624*(x^y)*((x|y)**2)*(x*y)*y + 954260094432837632*(x^y)*((x|y)**2)*(x*y)*(~(~x|y)) + 1947995473801379840*(x^y)*(x|y)*((x*y)**2)*x + 16498748599908171776*(x^y)*(x|y)*((x*y)**2)*y + 14550753126106791936*(x^y)*(x|y)*((x*y)**2)*(~(~x|y)) + 14322056923732508672*(x^y)*((x*y)**3)*x + 4124687149977042944*(x^y)*((x*y)**3)*y + 8249374299954085888*(x^y)*((x*y)**3)*(~(~x|y)) + 14195815516936863744*((x|y)**4)*x + 4250928556772687872*((x|y)**4)*y + 8501857113545375744*((x|y)**4)*(~(~x|y)) + 5693958403391488000*((x|y)**3)*(x*y)*x + 12752785670318063616*((x|y)**3)*(x*y)*y + 7058827266926575616*((x|y)**3)*(x*y)*(~(~x|y)) + 8711546213029117952*((x|y)**2)*((x*y)**2)*x + 9735197860680433664*((x|y)**2)*((x*y)**2)*y + 1023651647651315712*((x|y)**2)*((x*y)**2)*(~(~x|y)) + 13579145143369334784*(x|y)*((x*y)**3)*x + 4867598930340216832*(x|y)*((x*y)**3)*y + 9735197860680433664*(x|y)*((x*y)**3)*(~(~x|y)) + 10616540246629679104*((x*y)**4)*x + 7830203827079872512*((x*y)**4)*y + 15660407654159745024*((x*y)**4)*(~(~x|y)) + 9292874821136285696*((x^y)**3)*(x**2) + 18307738505146531840*((x^y)**3)*x*y + 18168732936583512064*((x^y)**3)*x*(~(~x|y)) + 9292874821136285696*((x^y)**3)*(y**2) + 278011137126039552*((x^y)**3)*y*(~(~x|y)) + 278011137126039552*((x^y)**3)*((~(~x|y))**2) + 14615797588306165760*((x^y)**2)*(x|y)*(x**2) + 7661892970806771712*((x^y)**2)*(x|y)*x*y + 15323785941613543424*((x^y)**2)*(x|y)*x*(~(~x|y)) + 14615797588306165760*((x^y)**2)*(x|y)*(y**2) + 3122958132096008192*((x^y)**2)*(x|y)*y*(~(~x|y)) + 3122958132096008192*((x^y)**2)*(x|y)*((~(~x|y))**2) + 15573534209657012224*((x^y)**2)*(x*y)*(x**2) + 5746419728105078784*((x^y)**2)*(x*y)*x*y + 11492839456210157568*((x^y)**2)*(x*y)*x*(~(~x|y)) + 15573534209657012224*((x^y)**2)*(x*y)*(y**2) + 6953904617499394048*((x^y)**2)*(x*y)*y*(~(~x|y)) + 6953904617499394048*((x^y)**2)*(x*y)*((~(~x|y))**2) + 7228418001979047936*(x^y)*((x|y)**2)*(x**2) + 3989908069751455744*(x^y)*((x|y)**2)*x*y + 7979816139502911488*(x^y)*((x|y)**2)*x*(~(~x|y)) + 7228418001979047936*(x^y)*((x|y)**2)*(y**2) + 10466927934206640128*(x^y)*((x|y)**2)*y*(~(~x|y)) + 10466927934206640128*(x^y)*((x|y)**2)*((~(~x|y))**2) + 10842627002968571904*(x^y)*(x|y)*(x*y)*(x**2) + 15208234141481959424*(x^y)*(x|y)*(x*y)*x*y + 11969724209254367232*(x^y)*(x|y)*(x*y)*x*(~(~x|y)) + 10842627002968571904*(x^y)*(x|y)*(x*y)*(y**2) + 6477019864455184384*(x^y)*(x|y)*(x*y)*y*(~(~x|y)) + 6477019864455184384*(x^y)*(x|y)*(x*y)*((~(~x|y))**2) + 13289357162967990272*(x^y)*((x*y)**2)*(x**2) + 10314773821483122688*(x^y)*((x*y)**2)*x*y + 2182803569256693760*(x^y)*((x*y)**2)*x*(~(~x|y)) + 13289357162967990272*(x^y)*((x*y)**2)*(y**2) + 16263940504452857856*(x^y)*((x*y)**2)*y*(~(~x|y)) + 16263940504452857856*(x^y)*((x*y)**2)*((~(~x|y))**2) + 8244176118215606272*((x|y)**3)*(x**2) + 1958391837278339072*((x|y)**3)*x*y + 3916783674556678144*((x|y)**3)*x*(~(~x|y)) + 8244176118215606272*((x|y)**3)*(y**2) + 14529960399152873472*((x|y)**3)*y*(~(~x|y)) + 14529960399152873472*((x|y)**3)*((~(~x|y))**2) + 13937710247557726208*((x|y)**2)*(x*y)*(x**2) + 9018067652303650816*((x|y)**2)*(x*y)*x*y + 18036135304607301632*((x|y)**2)*(x*y)*x*(~(~x|y)) + 13937710247557726208*((x|y)**2)*(x*y)*(y**2) + 410608769102249984*((x|y)**2)*(x*y)*y*(~(~x|y)) + 410608769102249984*((x|y)**2)*(x*y)*((~(~x|y))**2) + 15064968704095682560*(x|y)*((x*y)**2)*(x**2) + 6763550739227738112*(x|y)*((x*y)**2)*x*y + 13527101478455476224*(x|y)*((x*y)**2)*x*(~(~x|y)) + 15064968704095682560*(x|y)*((x*y)**2)*(y**2) + 4919642595254075392*(x|y)*((x*y)**2)*y*(~(~x|y)) + 4919642595254075392*(x|y)*((x*y)**2)*((~(~x|y))**2) + 17601300231306084352*((x*y)**3)*(x**2) + 1690887684806934528*((x*y)**3)*x*y + 3381775369613869056*((x*y)**3)*x*(~(~x|y)) + 17601300231306084352*((x*y)**3)*(y**2) + 15064968704095682560*((x*y)**3)*y*(~(~x|y)) + 15064968704095682560*((x*y)**3)*((~(~x|y))**2) + 3782451210800332800*((x^y)**2)*(x**3) + 7099390441308553216*((x^y)**2)*(x**2)*y + 14198780882617106432*((x^y)**2)*(x**2)*(~(~x|y)) + 11347353632400998400*((x^y)**2)*x*(y**2) + 8495926382184890368*((x^y)**2)*x*y*(~(~x|y)) + 8495926382184890368*((x^y)**2)*x*((~(~x|y))**2) + 14664292862909218816*((x^y)**2)*(y**3) + 14198780882617106432*((x^y)**2)*(y**2)*(~(~x|y)) + 9950817691524661248*((x^y)**2)*y*((~(~x|y))**2) + 6633878461016440832*((x^y)**2)*((~(~x|y))**3) + 1185477700307910656*(x^y)*(x|y)*(x**3) + 14890310972785819648*(x^y)*(x|y)*(x**2)*y + 11333877871862087680*(x^y)*(x|y)*(x**2)*(~(~x|y)) + 3556433100923731968*(x^y)*(x|y)*x*(y**2) + 14225732403694927872*(x^y)*(x|y)*x*y*(~(~x|y)) + 14225732403694927872*(x^y)*(x|y)*x*((~(~x|y))**2) + 17261266373401640960*(x^y)*(x|y)*(y**3) + 11333877871862087680*(x^y)*(x|y)*(y**2)*(~(~x|y)) + 4221011670014623744*(x^y)*(x|y)*y*((~(~x|y))**2) + 8962922471246266368*(x^y)*(x|y)*((~(~x|y))**3) + 14724166330513096704*(x^y)*(x*y)*(x**3) + 11167733229589364736*(x^y)*(x*y)*(x**2)*y + 3888722385469177856*(x^y)*(x*y)*(x**2)*(~(~x|y)) + 7279010844120186880*(x^y)*(x*y)*x*(y**2) + 10669299302771195904*(x^y)*(x*y)*x*y*(~(~x|y)) + 10669299302771195904*(x^y)*(x*y)*x*((~(~x|y))**2) + 3722577743196454912*(x^y)*(x*y)*(y**3) + 3888722385469177856*(x^y)*(x*y)*(y**2)*(~(~x|y)) + 7777444770938355712*(x^y)*(x*y)*y*((~(~x|y))**2) + 11333877871862087680*(x^y)*(x*y)*((~(~x|y))**3) + 7510756645073321984*((x|y)**2)*(x**3) + 14361218212199137280*((x|y)**2)*(x**2)*y + 10275692350688722944*((x|y)**2)*(x**2)*(~(~x|y)) + 4085525861510414336*((x|y)**2)*x*(y**2) + 16342103446041657344*((x|y)**2)*x*y*(~(~x|y)) + 16342103446041657344*((x|y)**2)*x*((~(~x|y))**2) + 10935987428636229632*((x|y)**2)*(y**3) + 10275692350688722944*((x|y)**2)*(y**2)*(~(~x|y)) + 2104640627667894272*((x|y)**2)*y*((~(~x|y))**2) + 13700923134251630592*((x|y)**2)*((~(~x|y))**3) + 11266134967609982976*(x|y)*(x*y)*(x**3) + 3095083244589154304*(x|y)*(x*y)*(x**2)*y + 6190166489178308608*(x|y)*(x*y)*(x**2)*(~(~x|y)) + 15351660829120397312*(x|y)*(x*y)*x*(y**2) + 6066411095352934400*(x|y)*(x*y)*x*y*(~(~x|y)) + 6066411095352934400*(x|y)*(x*y)*x*((~(~x|y))**2) + 7180609106099568640*(x|y)*(x*y)*(y**3) + 6190166489178308608*(x|y)*(x*y)*(y**2)*(~(~x|y)) + 12380332978356617216*(x|y)*(x*y)*y*((~(~x|y))**2) + 2104640627667894272*(x|y)*(x*y)*((~(~x|y))**3) + 11142329640494825472*((x*y)**2)*(x**3) + 3466499225934626816*((x*y)**2)*(x**2)*y + 6932998451869253632*((x*y)**2)*(x**2)*(~(~x|y)) + 14980244847774924800*((x*y)**2)*x*(y**2) + 4580747169971044352*((x*y)**2)*x*y*(~(~x|y)) + 4580747169971044352*((x*y)**2)*x*((~(~x|y))**2) + 7304414433214726144*((x*y)**2)*(y**3) + 6932998451869253632*((x*y)**2)*(y**2)*(~(~x|y)) + 13865996903738507264*((x*y)**2)*y*((~(~x|y))**2) + 3095083244589154304*((x*y)**2)*((~(~x|y))**3) + 17883941957357535232*(x^y)*(x**4) + 2251208465408065536*(x^y)*(x**3)*y + 4502416930816131072*(x^y)*(x**3)*(~(~x|y)) + 15069931375597453312*(x^y)*(x**2)*(y**2) + 4939493281261158400*(x^y)*(x**2)*y*(~(~x|y)) + 4939493281261158400*(x^y)*(x**2)*((~(~x|y))**2) + 2251208465408065536*(x^y)*x*(y**3) + 13507250792448393216*(x^y)*x*(y**2)*(~(~x|y)) + 8567757511187234816*(x^y)*x*y*((~(~x|y))**2) + 18009667723264524288*(x^y)*x*((~(~x|y))**3) + 17883941957357535232*(x^y)*(y**4) + 13944327142893420544*(x^y)*(y**3)*(~(~x|y)) + 4939493281261158400*(x^y)*(y**2)*((~(~x|y))**2) + 437076350445027328*(x^y)*y*((~(~x|y))**3) + 9441910212077289472*(x^y)*((~(~x|y))**4) + 12253738319090810880*(x|y)*(x**4) + 6325278944765411328*(x|y)*(x**3)*y + 12650557889530822656*(x|y)*(x**3)*(~(~x|y)) + 18182197693416210432*(x|y)*(x**2)*(y**2) + 17388558552536186880*(x|y)*(x**2)*y*(~(~x|y)) + 17388558552536186880*(x|y)*(x**2)*((~(~x|y))**2) + 6325278944765411328*(x|y)*x*(y**3) + 1058185521173364736*(x|y)*x*(y**2)*(~(~x|y)) + 2116371042346729472*(x|y)*x*y*((~(~x|y))**2) + 13708743410704187392*(x|y)*x*((~(~x|y))**3) + 12253738319090810880*(x|y)*(y**4) + 5796186184178728960*(x|y)*(y**3)*(~(~x|y)) + 17388558552536186880*(x|y)*(y**2)*((~(~x|y))**2) + 4738000663005364224*(x|y)*y*((~(~x|y))**3) + 11592372368357457920*(x|y)*((~(~x|y))**4) + 13801989757745496064*(x*y)*(x**4) + 132273190146670592*(x*y)*(x**3)*y + 264546380293341184*(x*y)*(x**3)*(~(~x|y)) + 9024962251634769920*(x*y)*(x**2)*(y**2) + 17653104932829528064*(x*y)*(x**2)*y*(~(~x|y)) + 17653104932829528064*(x*y)*(x**2)*((~(~x|y))**2) + 132273190146670592*(x*y)*x*(y**3) + 793639140880023552*(x*y)*x*(y**2)*(~(~x|y)) + 1587278281760047104*(x*y)*x*y*((~(~x|y))**2) + 1058185521173364736*(x*y)*x*((~(~x|y))**3) + 13801989757745496064*(x*y)*(y**4) + 18182197693416210432*(x*y)*(y**3)*(~(~x|y)) + 17653104932829528064*(x*y)*(y**2)*((~(~x|y))**2) + 17388558552536186880*(x*y)*y*((~(~x|y))**3) + 17917651313122869248*(x*y)*((~(~x|y))**4) + 4196088966933381120*(x**5) + 15913043312752197632*(x**4)*y + 13379342551794843648*(x**4)*(~(~x|y)) + 5067401521914707968*(x**3)*(y**2) + 1822862013949280256*(x**3)*y*(~(~x|y)) + 1822862013949280256*(x**3)*((~(~x|y))**2) + 13379342551794843648*(x**2)*(y**3) + 6489079015930855424*(x**2)*(y**2)*(~(~x|y)) + 12978158031861710848*(x**2)*y*((~(~x|y))**2) + 14801020045810991104*(x**2)*((~(~x|y))**3) + 2533700760957353984*x*(y**4) + 1822862013949280256*x*(y**3)*(~(~x|y)) + 5468586041847840768*x*(y**2)*((~(~x|y))**2) + 7291448055797121024*x*y*((~(~x|y))**3) + 3645724027898560512*x*((~(~x|y))**4) + 14250655106776170496*(y**5) + 13379342551794843648*(y**4)*(~(~x|y)) + 16623882059760271360*(y**3)*((~(~x|y))**2) + 14801020045810991104*(y**2)*((~(~x|y))**3) + 14801020045810991104*y*((~(~x|y))**4) + 13299105647808217088*((~(~x|y))**5)
   # solution = (((x^y)*0x2)+(((x*y)*0x3)+((x|y)*0x4)))
@@ -39047,7 +39537,7 @@ if __name__ == '__main__':
 
   # ==============================
 
-  # expression = ((((((-5599026202564138376*(~(x|(y|((234553563456|z)|(545464566+(~(545464566|w))))))))+(13630713475717973*(~(x|(y|(w|(-234553366785+(~(z|-234553366785)))))))))+(((~(x|(y|((234553563456+(~(234553563456|z)))|(545464566+(~(545464566|w)))))))*13630713475717973)+((~(x|(y|((z|-234553563457)|(545464566+(~(545464566|w)))))))*-2271492606100451572)))+(((((~(x|(y|(w|(-545267895|z)))))*-5599026202564138376)+((~(x|(y|((~((z|-234553563457)+234553563457))|(545464566+(~(545464566|w)))))))*9085260132263430))+((-1046961376785617458*(~(x|(y|((234553563456+(~(234553563456|z)))|(w|-545464567))))))+(1219980129416733915*(~(x|(y|(w|(-196673|z))))))))+(((~(x|(y|((-545464567+(~(w|-545464567)))|(234553563456|z)))))*1219980129416733915)+(((3496012542305994374*(~((x|(y|-545464567))|(w|(~((z|-234553563457)+234553563457))))))+((1224525582760188458*(~(x|((y|(-545464567+(~(w|-545464567))))|(234553563456+(~(234553563456|z)))))))+((~(y|(x|(-545464567|(z|(-234553563457+(~(w|-234553563457))))))))*-3327539243018332460)))+(((((((~(y|((545464566+(~(545464566|x)))|(z|(-234553563457+(~(w|-234553563457)))))))*1215434676073279372)+((((~(y|((~((z|-234553563457)+234553563457))|(545464566+(~(545464566|w))))))&x)*-1056052283472526544)+(((~(y|((234553563456+(~(234553563456|z)))|(545464566+(~(545464566|w))))))&x)*-1051506830129072001)))+((((-1046961376785617458*((~((y|(-545464567+(~(x|-545464567))))|(w|(~((z|-234553563457)+234553563457)))))+(~(y|((-545464567+(~(x|-545464567)))|(w|(234553563456+(~(234553563456|z)))))))))+(((((((((y&(~((x|(545464566+(~(545464566|w))))|(234553563456+(~(234553563456|z))))))*-1210894869284470485)+((((y&(~(x|((~((z|-234553563457)+234553563457))|(545464566+(~(545464566|w)))))))*1056046636917880888)+(-4545453343454543*(~(x|((-545464567+(~(y|-545464567)))|(w|(z|-234553563457)))))))+(((-2271486959545805916*(~(x|(((-545464567+(~(y|-545464567)))|w)|(234553563456+(~(234553563456|z)))))))+((-4545453343454543*(y&(~(x|((-545464567+(~(w|-545464567)))|(234553563456|z))))))+((~(x|((-545464567+(~(y|-545464567)))|(w|(~((z|-234553563457)+234553563457))))))*4538428465748157289)))+((((((1060592090261335431*(y&(~((545464566+(~(545464566|x)))|(w|(z|-234553563457))))))+((y&(~((545464566+(~(545464566|x)))|(w|(234553563456|z)))))*4547519372435066375))+(((y&(w&(~(545464566|(z|(234553563456+(~(234553563456|x))))))))*3336624503150595890)+(-2271486959545805916*(~(545464566|(w|(~((234553563456|y)+-234553563456))))))))+(((((y&(~((-545464567+(~(x|-545464567)))|(w|(234553563456+(~(234553563456|z)))))))*-2271486959545805916)+((4545453343454543*((~(w|((-234553563457+(~(y|-234553563457)))|((z&((~(545464566|x))|((x|-545464567)+545464567)))|(~(z|((~(545464566|x))|((x|-545464567)+545464567))))))))+(x&(y&(~((-545464567+(~(w|-545464567)))|(234553563456|z)))))))+(((545464566|((~(z|((~(-234553563457|(~(545464566|w))))|(~(w|235098831350)))))^x))*1060592090261335431)+((((~(z&((~(234553563456|z))|(~(-234553563457|(~(z|(~(-234553563457+(~(x|-234553563457)))))))))))&y)*2271486959545805916)+(2276032412889260459+(2276032412889260459*((z&x)|(~(z|x)))))))))+((2271486959545805916*(y&(~(-545464567|((z|(234553563456+(~(234553563456|x))))|w)))))+(((~(y|((545464566|x)+-545464566)))|(y&((545464566|x)+-545464566)))*-4545453343454543)))+(((y&(x&(~((234553563456+(~(234553563456|z)))|(545464566+(~(545464566|w)))))))*-2266941506202351373)+(4545453343454543*(~(z|-234553366785))))))+(((~(x*4542973919091611832))+-4542973919091611831)+((~(x|((~(-234553563457|(-545464567+(~(w|-545464567)))))|(~(((w|-545464567)+545464567)|196672)))))*-4542973919091611832)))+((~(x|((-545464567+(~(y|-545464567)))|(z|(-234553563457+(~(w|-234553563457)))))))*-4552064825778520918)))))+((~(x|((-545464567+(~(y|-545464567)))|(w|(234553563456|z)))))*-6823551785324326834))+((~(x|((z|(-234553563457+(~(w|-234553563457))))|(545464566+(~(545464566|y))))))*-3496018188860640030))+((-6823551785324326834*(y&(~(x|((234553563456|z)|(545464566+(~(545464566|w))))))))+(1060592090261335431*(~(x|((w|(545464566+(~(545464566|y))))|(~((z|-234553563457)+234553563457))))))))+((1056046636917880888*(~(x|((w|(545464566+(~(545464566|y))))|(234553563456+(~(234553563456|z)))))))+((~(x|((w|(z|-234553563457))|(545464566+(~(545464566|y))))))*-4561155732465430004)))+(((~(x|((w|(545464566+(~(545464566|y))))|(234553563456|z))))*-3491472735517185487)+((~(y|((-545464567+(~(x|-545464567)))|(~(w&((z|-234553563457)+234553563457))))))*-1046961376785617458)))+(1224525582760188458*((~(y|((-545464567+(~(x|-545464567)))|(z|(-234553563457+(~(w|-234553563457)))))))+((~((y|(-545464567+(~(w|-545464567))))|(234553563456+(~(234553563456|z)))))&x)))))+(((~(y|((-545464567+(~(w|-545464567)))|(234553563456|z))))&x)*1229071036103643001))+((1229071036103643001*(~((y|(-545464567+(~(x|-545464567))))|(w|(z|-234553563457)))))+((~(y|(-545464567|((z|(234553563456+(~(234553563456|x))))|w))))*3496012542305994374))))+((((~(y|((234553563456|z)|(545464566+(~(545464566|w))))))&x)*4552059179223875262)+(-1051506830129072001*(~(y|((545464566+(~(545464566|x)))|(w|(~((z|-234553563457)+234553563457)))))))))+((-1056052283472526544*(~(y|(((545464566+(~(545464566|x)))|w)|(234553563456+(~(234553563456|z)))))))+((~(y|((545464566+(~(545464566|x)))|(w|(z|-234553563457)))))*2276026766334614803)))+(((~(y|((545464566+(~(545464566|x)))|(w|(234553563456|z)))))*3491467088962539831)+(-1046961376785617458*(~(x|(y|((-545464567+(~(w|-545464567)))|(~((z|-234553563457)+234553563457)))))))))))))+((9085260132263430*(~(x|((y|(545464566|w))|(234553563456+(~(234553563456|z)))))))+((~(x|(y|(w|(z|-234553366785)))))*-3332084696361787003)))+((~(x|(y|(w|(z|235098831350)))))*-4538434112302802945))
+  expression = ((((((-5599026202564138376*(~(x|(y|((234553563456|z)|(545464566+(~(545464566|w))))))))+(13630713475717973*(~(x|(y|(w|(-234553366785+(~(z|-234553366785)))))))))+(((~(x|(y|((234553563456+(~(234553563456|z)))|(545464566+(~(545464566|w)))))))*13630713475717973)+((~(x|(y|((z|-234553563457)|(545464566+(~(545464566|w)))))))*-2271492606100451572)))+(((((~(x|(y|(w|(-545267895|z)))))*-5599026202564138376)+((~(x|(y|((~((z|-234553563457)+234553563457))|(545464566+(~(545464566|w)))))))*9085260132263430))+((-1046961376785617458*(~(x|(y|((234553563456+(~(234553563456|z)))|(w|-545464567))))))+(1219980129416733915*(~(x|(y|(w|(-196673|z))))))))+(((~(x|(y|((-545464567+(~(w|-545464567)))|(234553563456|z)))))*1219980129416733915)+(((3496012542305994374*(~((x|(y|-545464567))|(w|(~((z|-234553563457)+234553563457))))))+((1224525582760188458*(~(x|((y|(-545464567+(~(w|-545464567))))|(234553563456+(~(234553563456|z)))))))+((~(y|(x|(-545464567|(z|(-234553563457+(~(w|-234553563457))))))))*-3327539243018332460)))+(((((((~(y|((545464566+(~(545464566|x)))|(z|(-234553563457+(~(w|-234553563457)))))))*1215434676073279372)+((((~(y|((~((z|-234553563457)+234553563457))|(545464566+(~(545464566|w))))))&x)*-1056052283472526544)+(((~(y|((234553563456+(~(234553563456|z)))|(545464566+(~(545464566|w))))))&x)*-1051506830129072001)))+((((-1046961376785617458*((~((y|(-545464567+(~(x|-545464567))))|(w|(~((z|-234553563457)+234553563457)))))+(~(y|((-545464567+(~(x|-545464567)))|(w|(234553563456+(~(234553563456|z)))))))))+(((((((((y&(~((x|(545464566+(~(545464566|w))))|(234553563456+(~(234553563456|z))))))*-1210894869284470485)+((((y&(~(x|((~((z|-234553563457)+234553563457))|(545464566+(~(545464566|w)))))))*1056046636917880888)+(-4545453343454543*(~(x|((-545464567+(~(y|-545464567)))|(w|(z|-234553563457)))))))+(((-2271486959545805916*(~(x|(((-545464567+(~(y|-545464567)))|w)|(234553563456+(~(234553563456|z)))))))+((-4545453343454543*(y&(~(x|((-545464567+(~(w|-545464567)))|(234553563456|z))))))+((~(x|((-545464567+(~(y|-545464567)))|(w|(~((z|-234553563457)+234553563457))))))*4538428465748157289)))+((((((1060592090261335431*(y&(~((545464566+(~(545464566|x)))|(w|(z|-234553563457))))))+((y&(~((545464566+(~(545464566|x)))|(w|(234553563456|z)))))*4547519372435066375))+(((y&(w&(~(545464566|(z|(234553563456+(~(234553563456|x))))))))*3336624503150595890)+(-2271486959545805916*(~(545464566|(w|(~((234553563456|y)+-234553563456))))))))+(((((y&(~((-545464567+(~(x|-545464567)))|(w|(234553563456+(~(234553563456|z)))))))*-2271486959545805916)+((4545453343454543*((~(w|((-234553563457+(~(y|-234553563457)))|((z&((~(545464566|x))|((x|-545464567)+545464567)))|(~(z|((~(545464566|x))|((x|-545464567)+545464567))))))))+(x&(y&(~((-545464567+(~(w|-545464567)))|(234553563456|z)))))))+(((545464566|((~(z|((~(-234553563457|(~(545464566|w))))|(~(w|235098831350)))))^x))*1060592090261335431)+((((~(z&((~(234553563456|z))|(~(-234553563457|(~(z|(~(-234553563457+(~(x|-234553563457)))))))))))&y)*2271486959545805916)+(2276032412889260459+(2276032412889260459*((z&x)|(~(z|x)))))))))+((2271486959545805916*(y&(~(-545464567|((z|(234553563456+(~(234553563456|x))))|w)))))+(((~(y|((545464566|x)+-545464566)))|(y&((545464566|x)+-545464566)))*-4545453343454543)))+(((y&(x&(~((234553563456+(~(234553563456|z)))|(545464566+(~(545464566|w)))))))*-2266941506202351373)+(4545453343454543*(~(z|-234553366785))))))+(((~(x*4542973919091611832))+-4542973919091611831)+((~(x|((~(-234553563457|(-545464567+(~(w|-545464567)))))|(~(((w|-545464567)+545464567)|196672)))))*-4542973919091611832)))+((~(x|((-545464567+(~(y|-545464567)))|(z|(-234553563457+(~(w|-234553563457)))))))*-4552064825778520918)))))+((~(x|((-545464567+(~(y|-545464567)))|(w|(234553563456|z)))))*-6823551785324326834))+((~(x|((z|(-234553563457+(~(w|-234553563457))))|(545464566+(~(545464566|y))))))*-3496018188860640030))+((-6823551785324326834*(y&(~(x|((234553563456|z)|(545464566+(~(545464566|w))))))))+(1060592090261335431*(~(x|((w|(545464566+(~(545464566|y))))|(~((z|-234553563457)+234553563457))))))))+((1056046636917880888*(~(x|((w|(545464566+(~(545464566|y))))|(234553563456+(~(234553563456|z)))))))+((~(x|((w|(z|-234553563457))|(545464566+(~(545464566|y))))))*-4561155732465430004)))+(((~(x|((w|(545464566+(~(545464566|y))))|(234553563456|z))))*-3491472735517185487)+((~(y|((-545464567+(~(x|-545464567)))|(~(w&((z|-234553563457)+234553563457))))))*-1046961376785617458)))+(1224525582760188458*((~(y|((-545464567+(~(x|-545464567)))|(z|(-234553563457+(~(w|-234553563457)))))))+((~((y|(-545464567+(~(w|-545464567))))|(234553563456+(~(234553563456|z)))))&x)))))+(((~(y|((-545464567+(~(w|-545464567)))|(234553563456|z))))&x)*1229071036103643001))+((1229071036103643001*(~((y|(-545464567+(~(x|-545464567))))|(w|(z|-234553563457)))))+((~(y|(-545464567|((z|(234553563456+(~(234553563456|x))))|w))))*3496012542305994374))))+((((~(y|((234553563456|z)|(545464566+(~(545464566|w))))))&x)*4552059179223875262)+(-1051506830129072001*(~(y|((545464566+(~(545464566|x)))|(w|(~((z|-234553563457)+234553563457)))))))))+((-1056052283472526544*(~(y|(((545464566+(~(545464566|x)))|w)|(234553563456+(~(234553563456|z)))))))+((~(y|((545464566+(~(545464566|x)))|(w|(z|-234553563457)))))*2276026766334614803)))+(((~(y|((545464566+(~(545464566|x)))|(w|(234553563456|z)))))*3491467088962539831)+(-1046961376785617458*(~(x|(y|((-545464567+(~(w|-545464567)))|(~((z|-234553563457)+234553563457)))))))))))))+((9085260132263430*(~(x|((y|(545464566|w))|(234553563456+(~(234553563456|z)))))))+((~(x|(y|(w|(z|-234553366785)))))*-3332084696361787003)))+((~(x|(y|(w|(z|235098831350)))))*-4538434112302802945))
   # best_super_sure = ((((((((0x208020b6&z)&w)&x)*0x7e17c56b5ea3b170)+(((0x208020b6&(z^w))*0x1fa63d7c7f6b56fa)+((0x208020b6&z)*0xe07a0ea5285713a4)))+(((0xffffffc96384a6bf&z)&w)*0x204c21a7c26a9e))+(((x&(~(z|0x369c7b5940)))*0x3f0be2b5af51d8b8)+(((w&(0x208320f6^z))*0xffefd9ef2c1ecab1)+((((0xef418b4a537916e+(x*0xe08a34b5fc3848f3))+(y*0xe97b3e410bd8781))+((0xffffffc96384a6bf&z)*0x1f75cb4a03c7b70d))+((0x208320f6|z)*0x102610d3e1354f)))))+(((0x208020b6&w)&x)*0xc0f41d4a50ae2748))
   # expression = best_super_sure
   # best_sure = (((y*0xe97b3e410bd8781)+(0x102610d3e1354f*((z&(0x36bcf879b6^w))+x)))+(((((0xc0f41d4a50ae2748*(((0x208020b6&z)&w)+((0x208020b6&w)&x)))+((((0x208020b6&z)&w)&x)*0x7e17c56b5ea3b170))+((0x208020b6&w)*0x1fa63d7c7f6b56fa))+((0x208320f6&w)*0xffefd9ef2c1ecab1))+(0x763c04fb491c9858+((x^(0x369c7b5940|z))*0x1f85f15ad7a8ec5c))))
@@ -41242,6 +41732,92 @@ if __name__ == '__main__':
 
   expressions = expressions_0
 
+  # expressions = [(((x&0x19db8d4c50945260)^((x&0xe62472b3af6bad9c)+0x99db8d4c50945260)), ((x&0xfffffffffffffffc)^0x99db8d4c50945260))]
+  # expressions = [(((x&0x19db8d4c50945260)^((x&0xe62472b3af6bad9c)^0x99db8d4c50945260)), ((x&0xfffffffffffffffc)^0x99db8d4c50945260))]
+  # expressions = [
+  #   (
+  #     7471873370*(~(16832296021645948&y)) + 13501837082223831846 + 3735936685*y,
+  #     (3735936685*(16832296021645948^y))
+  #   )
+  # ]
+
+  # x = ((((a&b)&c)&d)&e)
+  # A = (171*(51&x))
+  # B = (22*(4&x))
+  # C = (245*(8&x))
+
+  # expression = A + B + C
+
+  # b = 0
+  # d = 0
+  # e = 0
+
+  # v5=(((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((x^0x3FB27BEF)+686588744)^0x3FB27BEF)+607396168)^0x3FB27BEF)+1220555080)^0x3FB27BEF)-146276352)^0x3FB27BEF)-1055864383)^0x3FB27BEF)-1991505684)^0x3FB27BEF)+1753110293)^0x3FB27BEF)+122395974)^0x3FB27BEF)+1090684159)^0x3FB27BEF)+1103792449)^0x3FB27BEF)-146735104)^0x3FB27BEF)+1140850903)^0x3FB27BEF)+605326156)^0x3FB27BEF)-1903343535)^0x3FB27BEF)-1584708506)^0x3FB27BEF)+21259865)^0x3FB27BEF)+1069180612)^0x3FB27BEF)+1097255961)^0x3FB27BEF)+24684169)^0x3FB27BEF)+1727603748)^0x3FB27BEF)+1711809636)^0x3FB27BEF)-1989801720)^0x3FB27BEF)-146254080)^0x3FB27BEF)-0x10000)^0x3FB27BEF)+1026778719)^0x3FB27BEF)-1081252249)^0x3FB27BEF)+1733409638)^0x3FB27BEF)+143476989)^0x3FB27BEF)+1207959552)^0x3FB27BEF)-2125937758)^0x3FB27BEF)+1586063010)^0x3FB27BEF)-1638780068)^0x3FB27BEF)-1958161879)^0x3FB27BEF)-97957888)^0x3FB27BEF)+1222309704)^0x3FB27BEF)-819902255)^0x3FB27BEF)+1104621896)^0x3FB27BEF)+1484958213)^0x3FB27BEF)+266895681)^0x3FB27BEF)+21551351)^0x3FB27BEF)-1958193087)^0x3FB27BEF)-821999616)^0x3FB27BEF)-1991714313)^0x3FB27BEF)+1686980608)^0x3FB27BEF)-146267116)^0x3FB27BEF)-504790712)^0x3FB27BEF)+1512313889)^0x3FB27BEF)+1220780559)^0x3FB27BEF)+1101139847)^0x3FB27BEF)+860156809)^0x3FB27BEF)-1223998371)^0x3FB27BEF)+1172754753)^0x3FB27BEF)+1154560497)^0x3FB27BEF)-146188735)^0x3FB27BEF)+1096696100)^0x3FB27BEF)-2126405105)^0x3FB27BEF)+2123064994)^0x3FB27BEF)+610569544)^0x3FB27BEF)+1006724644)^0x3FB27BEF)-821991900)^0x3FB27BEF)+2122933768)^0x3FB27BEF)+1082877647)^0x3FB27BEF)-148630281)^0x3FB27BEF)+588302529
+  # v6=((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((v5^0x3FB27BEF)+567408400)^0x3FB27BEF)-1924611166)^0x3FB27BEF)-1081251903)^0x3FB27BEF)-1924607497)^0x3FB27BEF)+1092881545)^0x3FB27BEF)-2125920220)^0x3FB27BEF)-1903607377)^0x3FB27BEF)+1380015681)^0x3FB27BEF)+1106839816)^0x3FB27BEF)+1213422145)^0x3FB27BEF)-1924619761)^0x3FB27BEF)-256330613)^0x3FB27BEF)+1711809636)^0x3FB27BEF)+1711276032)^0x3FB27BEF)+1724776769)^0x3FB27BEF)+1392508928)^0x3FB27BEF)+13336904)^0x3FB27BEF)+1219625407)^0x3FB27BEF)+1374912870)^0x3FB27BEF)-1989796134)^0x3FB27BEF)+227231744)^0x3FB27BEF)-910611610)^0x3FB27BEF)-625571004)^0x3FB27BEF)+1727473988)^0x3FB27BEF)-625571516)^0x3FB27BEF)+257209997)^0x3FB27BEF)-989591610)^0x3FB27BEF)+1542357321)^0x3FB27BEF)-2125926143)^0x3FB27BEF)-1048491870)^0x3FB27BEF)+282116424)^0x3FB27BEF)-1)^0x3FB27BEF)+558387440)^0x3FB27BEF)+1213612504)^0x3FB27BEF)+692635903)^0x3FB27BEF)+1686980644)^0x3FB27BEF)-1991760844)^0x3FB27BEF)+337725650)^0x3FB27BEF)-1778169616)^0x3FB27BEF)-1014968)^0x3FB27BEF)-1991720447)^0x3FB27BEF)+485969920)^0x3FB27BEF)-1924607447)^0x3FB27BEF)+11175563)^0x3FB27BEF)+63638)^0x3FB27BEF)+334)^0x3FB27BEF)+1874839239)^0x3FB27BEF)-593227967)^0x3FB27BEF)-1542503408)^0x3FB27BEF)+657793868)^0x3FB27BEF)-1043904175)^0x3FB27BEF)-924221111)^0x3FB27BEF)-146223319)^0x3FB27BEF)+49344385)^0x3FB27BEF)+1238862153)^0x3FB27BEF)-265204486)^0x3FB27BEF)+1598159409)^0x3FB27BEF)+152221834)^0x3FB27BEF)+1220780493)^0x3FB27BEF)+1447150498)^0x3FB27BEF)+1277435127)^0x3FB27BEF
+  # expression = ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((v6+136602765)^0x3FB27BEF)+495798355)^0x3FB27BEF)-736296120)^0x3FB27BEF)-1957864645)^0x3FB27BEF)-1924599415)^0x3FB27BEF)+1797564063)^0x3FB27BEF)+1290980291)^0x3FB27BEF)-2125898253)^0x3FB27BEF)-1098169917)^0x3FB27BEF)+1586689921)^0x3FB27BEF)+225629464)^0x3FB27BEF)+914896267)^0x3FB27BEF)-1279740275)^0x3FB27BEF)-147766025)^0x3FB27BEF)+1240936772)^0x3FB27BEF)+558628864)^0x3FB27BEF)+0xFFFFFF)^0x3FB27BEF)-1102449887)^0x3FB27BEF)-1)^0x3FB27BEF)-1010743280)^0x3FB27BEF)+1686980656)^0x3FB27BEF)+80169202)^0x3FB27BEF)+338249983)^0x3FB27BEF)+1686980644)^0x3FB27BEF)-64)^0x3FB27BEF)+1230324004)^0x3FB27BEF)-2125870491)^0x3FB27BEF)-292991738)^0x3FB27BEF)+591930372)^0x3FB27BEF)-1453440715)^0x3FB27BEF)+615812428)^0x3FB27BEF)+1221626184)^0x3FB27BEF)+1470406566)^0x3FB27BEF)-634828584)^0x3FB27BEF)+1287898952)^0x3FB27BEF)+1210319915)^0x3FB27BEF)-2125938175)^0x3FB27BEF)+209799228)^0x3FB27BEF)+469977148)^0x3FB27BEF)+605325640)^0x3FB27BEF)+1224343880)^0x3FB27BEF)+136602765)^0x3FB27BEF)+1342177281)^0x3FB27BEF)-783757279)^0x3FB27BEF)+67323940)^0x3FB27BEF)-1991768028)^0x3FB27BEF)+495667200)^0x3FB27BEF)+147571016)^0x3FB27BEF)-906788536)^0x3FB27BEF)+1280827273)^0x3FB27BEF)+692846592)^0x3FB27BEF)-1867085492)^0x3FB27BEF)+1210324109)^0x3FB27BEF)-951475697)^0x3FB27BEF)-0x368A1DB7B72B777
+
+  expressions = [
+    # (
+    #   ((((((((((((((((5392086642083357997^a)+(2931761665218550615*(4126506293698930151&(d&f))))+(4915358423685359774*(11062281046932093&((c&f)&g))))+(2931761665218550615*(4126506293698930151&((e&f)&g))))+(2931761665218550615*(4126506293698930151&(((a&b)&f)&g))))+(4915358423685359774*(11062281046932093&(((b&c)&d)&e))))+(-2931761665218550615*(4126506293698930151&(((d&e)&f)&g))))+(4915358423685359774*(11062281046932093&((((a&b)&c)&d)&g))))+(-2931761665218550615*(4126506293698930151&((((a&b)&d)&f)&g))))+(-2931761665218550615*(4126506293698930151&((((a&b)&e)&f)&g))))+(-4915358423685359774*(11062281046932093&(((((a&b)&c)&d)&e)&g))))+(-4915358423685359774*(11062281046932093&(((((a&b)&c)&d)&f)&g))))+(2931761665218550615*(4126506293698930151&(((((a&b)&d)&e)&f)&g))))+(-4915358423685359774*(11062281046932093&(((((b&c)&d)&e)&f)&g))))+(4915358423685359774*(11062281046932093&((((((a&b)&c)&d)&e)&f)&g))))+(-1*((4915358423685359774*(-9212309755807843715&((((c&f)&g)|(((b&c)&d)&e))|((((a&b)&c)&d)&g))))+(2931761665218550615*(4126506293698930151&(((d&f)|((e&f)&g))|(((a&b)&f)&g))))))),
+    #   None
+    # ),
+    # (
+    #   10*((x&4)&(2*(x&2))) + 4*(x&4&~((2*(x&2)))),
+    #   None
+    # ),
+    # (
+    #   (((((255&((((8990795901252240894*(237367281123732863&((b|(a&e))|(((a&c)&d)&e))))+(-8163698701685272066*(3116704613164221181&(((((a&b)&c)&e)|(b&d))|a))))+(((((~b)&b)^-7468006015578680781)&3478191297491176188)+((a&8468269591804468511)|-2055869655809442967)))+11111))+(-256&(((((((((((((((((((((((((((((-9047506517950612738*(1&a))+(8781468128722105473*(2&a)))+(838721381103168575*(4&a)))+(949197358136336158*(8&a)))+(1004435346652919951*(16&a)))+(455593588607788358*(32&a)))+(181172709585222562*(64&a)))+(8106988084986900222*(1&b)))+(8548891993119570558*(2&b)))+(4158157928758517822*(4&b)))+(1962790896577991454*(8&b)))+(865107380487728270*(16&b)))+(316265622442596678*(32&b)))+(41844743420030882*(64&b)))+(883807816265340672*(1&(a&b))))+(-8781468128722105472*(2&(a&b))))+(-4390734064361052736*(4&(a&b))))+(-2195367032180526368*(8&(a&b))))+(-1097683516090263184*(16&(a&b))))+(-548841758045131592*(32&(a&b))))+(-223017453005253444*(64&(a&b))))+(8990795901252240894*(63&(a&e))))+(-181172709585222562*(64&(a&e))))+(-8163698701685272066*(61&(b&d))))+(-41844743420030882*(64&(b&d))))+(8163698701685272066*(61&((a&b)&d))))+(41844743420030882*(64&((a&b)&d))))+(-8990795901252240894*(63&((a&b)&e))))+(181172709585222562*(64&((a&b)&e))))))+(((((((((((((((((((((((((((((((((-883807816265340672+(883807816265340672*(1&a)))+(-8781468128722105472*(2&a)))+(-4390734064361052736*(4&a)))+(-2195367032180526368*(8&a)))+(-1097683516090263184*(16&a)))+(-548841758045131592*(32&a)))+(-274420879022565796*(64&a)))+(-93248169437343234*(3116632040548172416&a)))+(1478588061519856640&a))+(-787308916225*(72572616048640&a)))+(883807816265340672*(1&b)))+(-8781468128722105472*(2&b)))+(-4390734064361052736*(4&b)))+(-2195367032180526368*(8&b)))+(-1097683516090263184*(16&b)))+(-548841758045131592*(32&b)))+(-274420879022565796*(64&b)))+(-16403353488751106*(237367281123732736&b)))+(-883807816265340672*(1&(a&b))))+(8781468128722105472*(2&(a&b))))+(4390734064361052736*(4&(a&b))))+(2195367032180526368*(8&(a&b))))+(1097683516090263184*(16&(a&b))))+(548841758045131592*(32&(a&b))))+(511247829156965188*(64&(a&b))))+(236826950134399392*(64&(a&e))))+(-16403353488751106*(237367281123732736&(a&e))))+(236826950134399392*(64&(b&d))))+(-93248169437343234*(3116704613164221056&(b&d))))+(-236826950134399392*(64&((a&b)&d))))+(93248169437343234*(3116704613164221056&((a&b)&d))))+(-236826950134399392*(64&((a&b)&e))))+(16403353488751106*(237367281123732736&((a&b)&e)))))+(-1*((8990795901252240894*(237367281123732863&((b|(a&e))|(((a&c)&d)&e))))+(-8163698701685272066*(3116704613164221181&(((((a&b)&c)&e)|(b&d))|a))))))+(-1*11111)),
+    #   1172061839544091184+(-2055869655809442967|8468269591804468511&a)
+    # ),
+    # (
+    #   (((((255&(((((((((((((((((((255*(153&a))+(255*(153&c)))+(213*(59&e)))+(153&(a&c)))+(213*(59&(a&d))))+(214*(55&(a&e))))+(214*(55&(b&d))))+(43*(59&((a&d)&e))))+(213*(59&((b&c)&d))))+(214*(55&((b&c)&e))))+(43*(59&(((a&b)&c)&d))))+(42*(55&(((a&b)&c)&e))))+(42*(55&(((a&b)&d)&e))))+(85*(51&(((b&c)&d)&e))))+(234*(4&(((b&c)&d)&e))))+(11*(8&(((b&c)&d)&e))))+(171*(51&((((a&b)&c)&d)&e))))+(22*(4&((((a&b)&c)&d)&e))))+(245*(8&((((a&b)&c)&d)&e)))))+(-256&((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((1792939206651362047*(1&a))+(224117400831420255*(8&a)))+(112058700415710127*(16&a)))+(14007337551963765*(128&a)))+(1792939206651362047*(1&c)))+(224117400831420255*(8&c)))+(112058700415710127*(16&c)))+(14007337551963765*(128&c)))+(-1632751984762002475*(1&e)))+(6694150448767092309*(2&e)))+(1410112227845443637*(8&e)))+(145132022822886533*(16&e)))+(89102672615031469*(32&e)))+(-1792939206651362047*(1&(a&c))))+(-224117400831420255*(8&(a&c))))+(-112058700415710127*(16&(a&c))))+(-14007337551963765*(128&(a&c))))+(-3425691191413364523*(25&(a&d))))+(6694150448767092309*(2&(a&d))))+(89102672615031469*(32&(a&d))))+(-2446662093502559018*(1&(a&e))))+(-653722886851196970*(34&(a&e))))+(4406197933239031446*(4&(a&e))))+(-224117400831420256*(8&(a&e))))+(387139917339939878*(16&(a&e))))+(1139216319800165078*(1&(b&d))))+(242746716474484054*(2&(b&d))))+(4406197933239031446*(4&(b&d))))+(611257318171360134*(16&(b&d))))+(555227967963505070*(32&(b&d))))+(-1792939206651362048*(1&(c&e))))+(-224117400831420256*(8&(c&e))))+(-112058700415710128*(16&(c&e))))+(-1792939206651362048*(1&((a&b)&d))))+(-896469603325681024*(2&((a&b)&d))))+(-112058700415710128*(16&((a&b)&d))))+(-632490102511278552*(32&((a&b)&d))))+(1792939206651362048*(1&((a&c)&e))))+(224117400831420256*(8&((a&c)&e))))+(112058700415710128*(16&((a&c)&e))))+(3425691191413364523*(25&((a&d)&e))))+(-6694150448767092309*(2&((a&d)&e))))+(-89102672615031469*(32&((a&d)&e))))+(-5218630398064726571*(1&((b&c)&d))))+(5797680845441411285*(42&((b&c)&d))))+(-78985378008533723*(16&((b&c)&d))))+(-653722886851196970*(51&((b&c)&e))))+(4406197933239031446*(4&((b&c)&e))))+(-1792939206651362048*(1&((b&d)&e))))+(-896469603325681024*(2&((b&d)&e))))+(-112058700415710128*(16&((b&d)&e))))+(-632490102511278552*(32&((b&d)&e))))+(5218630398064726571*(1&(((a&b)&c)&d))))+(-5797680845441411285*(42&(((a&b)&c)&d))))+(78985378008533723*(16&(((a&b)&c)&d))))+(653722886851196970*(51&(((a&b)&c)&e))))+(-4406197933239031446*(4&(((a&b)&c)&e))))+(2446662093502559018*(1&(((a&b)&d)&e))))+(1550192490176877994*(2&(((a&b)&d)&e))))+(-4406197933239031446*(4&(((a&b)&d)&e))))+(-387139917339939878*(16&(((a&b)&d)&e))))+(709752237059052034*(32&(((a&b)&d)&e))))+(5872353284915923541*(1&(((b&c)&d)&e))))+(-5143957958590214315*(34&(((b&c)&d)&e))))+(-4406197933239031446*(4&(((b&c)&d)&e))))+(-1185994827014023381*(8&(((b&c)&d)&e))))+(-420213239747116283*(16&(((b&c)&d)&e))))+(-5872353284915923541*(1&((((a&b)&c)&d)&e))))+(5143957958590214315*(34&((((a&b)&c)&d)&e))))+(4406197933239031446*(4&((((a&b)&c)&d)&e))))+(1185994827014023381*(8&((((a&b)&c)&d)&e))))+(420213239747116283*(16&((((a&b)&c)&d)&e))))))+((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((1792939206651362048+(-1792939206651362048*(1&a)))+(-224117400831420256*(8&a)))+(-112058700415710128*(16&a)))+(-14007337551963766*(128&a)))+(-1*(1792939206651350784&a)))+(-1792939206651362048*(1&c)))+(-224117400831420256*(8&c)))+(-112058700415710128*(16&c)))+(-14007337551963766*(128&c)))+(-1*(1792939206651350784&c)))+(-1792939206651362048*(1&e)))+(-896469603325681024*(2&e)))+(-224117400831420256*(8&e)))+(-112058700415710128*(16&e)))+(-56029350207855064*(32&e)))+(15058923897694421*(8473907533822997504&e)))+(1792939206651362048*(1&(a&c))))+(224117400831420256*(8&(a&c))))+(112058700415710128*(16&(a&c))))+(14007337551963766*(128&(a&c))))+(1792939206651350784&(a&c)))+(-896469603325681024*(2&(a&d))))+(-56029350207855064*(32&(a&d))))+(15058923897694421*(8473907533822997504&(a&d))))+(1792939206651362048*(1&(a&e))))+(-448234801662840512*(4&(a&e))))+(224117400831420256*(8&(a&e))))+(112058700415710128*(16&(a&e))))+(30824256509118422*(8283553510374996480&(a&e))))+(-1792939206651362048*(1&(b&d))))+(-896469603325681024*(2&(b&d))))+(-448234801662840512*(4&(b&d))))+(-112058700415710128*(16&(b&d))))+(-56029350207855064*(32&(b&d))))+(30824256509118422*(8283553510374996480&(b&d))))+(1792939206651362048*(1&(c&e))))+(224117400831420256*(8&(c&e))))+(112058700415710128*(16&(c&e))))+(1792939206651362048*(1&((a&b)&d))))+(896469603325681024*(2&((a&b)&d))))+(112058700415710128*(16&((a&b)&d))))+(56029350207855064*(32&((a&b)&d))))+(-1792939206651362048*(1&((a&c)&e))))+(-224117400831420256*(8&((a&c)&e))))+(-112058700415710128*(16&((a&c)&e))))+(896469603325681024*(2&((a&d)&e))))+(56029350207855064*(32&((a&d)&e))))+(-15058923897694421*(8473907533822997504&((a&d)&e))))+(1792939206651362048*(1&((b&c)&d))))+(112058700415710128*(16&((b&c)&d))))+(-2955474611787563*(8473907533822997504&((b&c)&d))))+(-448234801662840512*(4&((b&c)&e))))+(30824256509118422*(8283553510374996480&((b&c)&e))))+(1792939206651362048*(1&((b&d)&e))))+(896469603325681024*(2&((b&d)&e))))+(112058700415710128*(16&((b&d)&e))))+(56029350207855064*(32&((b&d)&e))))+(-1792939206651362048*(1&(((a&b)&c)&d))))+(-112058700415710128*(16&(((a&b)&c)&d))))+(2955474611787563*(8473907533822997504&(((a&b)&c)&d))))+(448234801662840512*(4&(((a&b)&c)&e))))+(-30824256509118422*(8283553510374996480&(((a&b)&c)&e))))+(-1792939206651362048*(1&(((a&b)&d)&e))))+(-896469603325681024*(2&(((a&b)&d)&e))))+(448234801662840512*(4&(((a&b)&d)&e))))+(-112058700415710128*(16&(((a&b)&d)&e))))+(-56029350207855064*(32&(((a&b)&d)&e))))+(5204540509845546*(8283553510374996480&(((a&b)&d)&e))))+(-1792939206651362048*(1&(((b&c)&d)&e))))+(448234801662840512*(4&(((b&c)&d)&e))))+(-112058700415710128*(16&(((b&c)&d)&e))))+(-30824256509118422*(172262713711479296&(((b&c)&d)&e))))+(-15058923897694421*(362616737159480320&(((b&c)&d)&e))))+(3656415494262613*(8111290796663517184&(((b&c)&d)&e))))+(1792939206651362048*(1&((((a&b)&c)&d)&e))))+(-448234801662840512*(4&((((a&b)&c)&d)&e))))+(112058700415710128*(16&((((a&b)&c)&d)&e))))+(30824256509118422*(172262713711479296&((((a&b)&c)&d)&e))))+(15058923897694421*(362616737159480320&((((a&b)&c)&d)&e))))+(-3656415494262613*(8111290796663517184&((((a&b)&c)&d)&e)))))+(-1*((-653722886851196970*(-939818526479779273&((((b&c)&e)|(b&d))|(a&e))))+(-3425691191413364523*(8473907533822997563&((e|((b&c)&d))|(a&d)))))))+(-1*11111)),
+    #   (((~a)&1792939206651350937)&(~c))
+    # ),
+    # (
+    #   expression,
+    #   None
+    # ),
+    (
+      # ((x + (x ^ 0xF) - (x & 0xFFFFFFFFFFFFFFF0)) ^ 1) + 2,
+      # (x & 99999999) * (~x & 4194967296) + (x | 4194967296) * (x & 4194967296),
+      # (~x & 0xFFF0BDC0) * (x & 0xF423F) + (x | 0xFFF0BDC0) * (x & 0xFFF0BDC0),
+      # ((~x & 0x6FA14FB0EF5CC1EF | x & 0x905EB04F10A33E10) ^ 0x6FA14FB0EF5CC1E0 | x & 0xF) + 1,
+      # ((((((((1099511627775 ^ (-2223 + (x & 6))) * 7983231184792449384) + ((((x & 1111) ^ 2222) * 2000148955279027632) + (((1105 ^ (x & 1099511625553)) * 3392087217430443721) + ((1099511625553 & (x ^ -1112)) * 3528000921577288962)))) + (((((x & 1105) * 7661875297362417069) + ((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 6983004516024388441)) + (((x ^ -1112) + (((1111 & (~x)) * 2) + (x + -2694360946117271215))) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 4269788079931973346) + ((((~x) | -1106) * 2527774252809228019) + (((x & 1111) ^ -2223) * 6258160761835117939))))) + (((1099511627775 ^ (x | -1099511624449)) * -2849130140239260336) + (((x & 1111) ^ 2222) * -3725219378236359078)))) * ((((((1099511627775 ^ (-2223 + (x & 6))) * 7983231184792449384) + ((((x & 1111) ^ 2222) * 2000148955279027632) + (((1105 ^ (x & 1099511625553)) * 3392087217430443721) + ((1099511625553 & (x ^ -1112)) * 3528000921577288962)))) + (((((x & 1105) * 7661875297362417069) + ((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 6983004516024388441)) + (((x ^ -1112) + (((1111 & (~x)) * 2) + (x + -2694360946117271215))) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 4269788079931973346) + ((((~x) | -1106) * 2527774252809228019) + (((x & 1111) ^ -2223) * 6258160761835117939))))) + (((1099511627775 ^ (x | -1099511624449)) * -2849130140239260336) + (((x & 1111) ^ 2222) * -3725219378236359078)))) * (((1099511627775 ^ (x | -1099511624449)) * 4775745522797379584) + ((((-8134388765490675712 + (x * 3178634119571570688)) + (((1111 & (~x)) * 6357268239143141376) + (((x ^ 1111) * -3178634119571570688) + ((((x & 1111) ^ 2222) * -893924771815751680) + ((1105 ^ (x & 1099511625553)) * -3408590482530369536))))) + ((((~x) | -1106) * -7085496557113442304) + (((1099511627775 ^ (-2223 + (x & 6))) * 8469424406744006656) + ((((x & 1111) ^ 1099511625553) * -1566429892029972480) + (((x & 1111) ^ -2223) * 2723340888678858752))))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 9025478927610544128) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -8878480218751238144) + ((((x & 1111) ^ 2222) * 8849521315858612224) + (-4814714431088885760 + (((x & 1105) * -5929802462138466304) + ((1099511625553 & (x ^ -1112)) * -7641551077979979776))))))))) + (((((x & 1105) * -4779242736425369600) + (((x & 1111) ^ 1099511625553) * 3712303880776712192)) + (((((1099511627775 ^ (x | -1099511624449)) * 3868563045932335104) + (((x & 1111) ^ -2223) * 202670970450739200)) + (((x & 1111) ^ 2222) * 191601892688658432)) + ((((1111 & (~x)) * -7035179078210551808) + (((x ^ 1111) * 3517589539105275904) + ((1099511625553 & (x ^ -1112)) * 7668732306793693184))) + ((1105 ^ (x & 1099511625553)) * 5259058877663543296)))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 9165385062768705536) + (((1099511627775 ^ (-2223 + (x & 6))) * -6864349584395599872) + ((((x * -3517589539105275904) + -3844649561381404672) + ((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -3003122535878361088)) + ((((x & 1111) ^ 2222) * -4341431991669882880) + (((~x) | -1106) * 5251722880248446976)))))))) + (((((x & 1111) ^ 2222) * 2244633785447586482) + (((x * 5260339532280414813) + -1518274732215468443) + (((x ^ 1111) * -5260339532280414813) + ((((1099511625553 & (x ^ -1112)) * -4461059745911470662) + ((1111 & (~x)) * -7926065009148721990)) + ((1099511627775 ^ (x | -1099511624449)) * -240212134403482096))))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 5881601438423093589) + (((((x & 1111) ^ -2223) * -7980724869601410460) + (((~x) | -1106) * 1969879376998569031)) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 1121755840066501658) + ((((1099511627775 ^ (-2223 + (x & 6))) * -549337684486946104) + (((x & 1111) ^ 2222) * -3095549074654021392)) + ((((x & 1111) ^ -2223) * -6605932645521107357) + (((1105 ^ (x & 1099511625553)) * 58573718041639173) + (((x & 1105) * -6745735451040581159) + -4821700281647061510))))))))) * ((((((((1099511627775 ^ (-2223 + (x & 6))) * 7983231184792449384) + ((((x & 1111) ^ 2222) * 2000148955279027632) + (((1105 ^ (x & 1099511625553)) * 3392087217430443721) + ((1099511625553 & (x ^ -1112)) * 3528000921577288962)))) + (((((x & 1105) * 7661875297362417069) + ((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 6983004516024388441)) + (((x ^ -1112) + (((1111 & (~x)) * 2) + (x + -2694360946117271215))) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 4269788079931973346) + ((((~x) | -1106) * 2527774252809228019) + (((x & 1111) ^ -2223) * 6258160761835117939))))) + (((1099511627775 ^ (x | -1099511624449)) * -2849130140239260336) + (((x & 1111) ^ 2222) * -3725219378236359078)))) * ((((((1099511627775 ^ (-2223 + (x & 6))) * 7983231184792449384) + ((((x & 1111) ^ 2222) * 2000148955279027632) + (((1105 ^ (x & 1099511625553)) * 3392087217430443721) + ((1099511625553 & (x ^ -1112)) * 3528000921577288962)))) + (((((x & 1105) * 7661875297362417069) + ((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 6983004516024388441)) + (((x ^ -1112) + (((1111 & (~x)) * 2) + (x + -2694360946117271215))) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 4269788079931973346) + ((((~x) | -1106) * 2527774252809228019) + (((x & 1111) ^ -2223) * 6258160761835117939))))) + (((1099511627775 ^ (x | -1099511624449)) * -2849130140239260336) + (((x & 1111) ^ 2222) * -3725219378236359078)))) * (((1099511627775 ^ (x | -1099511624449)) * 4775745522797379584) + ((((-8134388765490675712 + (x * 3178634119571570688)) + (((1111 & (~x)) * 6357268239143141376) + (((x ^ 1111) * -3178634119571570688) + ((((x & 1111) ^ 2222) * -893924771815751680) + ((1105 ^ (x & 1099511625553)) * -3408590482530369536))))) + ((((~x) | -1106) * -7085496557113442304) + (((1099511627775 ^ (-2223 + (x & 6))) * 8469424406744006656) + ((((x & 1111) ^ 1099511625553) * -1566429892029972480) + (((x & 1111) ^ -2223) * 2723340888678858752))))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 9025478927610544128) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -8878480218751238144) + ((((x & 1111) ^ 2222) * 8849521315858612224) + (-4814714431088885760 + (((x & 1105) * -5929802462138466304) + ((1099511625553 & (x ^ -1112)) * -7641551077979979776))))))))) + (((((x & 1105) * -4779242736425369600) + (((x & 1111) ^ 1099511625553) * 3712303880776712192)) + (((((1099511627775 ^ (x | -1099511624449)) * 3868563045932335104) + (((x & 1111) ^ -2223) * 202670970450739200)) + (((x & 1111) ^ 2222) * 191601892688658432)) + ((((1111 & (~x)) * -7035179078210551808) + (((x ^ 1111) * 3517589539105275904) + ((1099511625553 & (x ^ -1112)) * 7668732306793693184))) + ((1105 ^ (x & 1099511625553)) * 5259058877663543296)))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 9165385062768705536) + (((1099511627775 ^ (-2223 + (x & 6))) * -6864349584395599872) + ((((x * -3517589539105275904) + -3844649561381404672) + ((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -3003122535878361088)) + ((((x & 1111) ^ 2222) * -4341431991669882880) + (((~x) | -1106) * 5251722880248446976)))))))) + (((((x & 1111) ^ 2222) * 2244633785447586482) + (((x * 5260339532280414813) + -1518274732215468443) + (((x ^ 1111) * -5260339532280414813) + ((((1099511625553 & (x ^ -1112)) * -4461059745911470662) + ((1111 & (~x)) * -7926065009148721990)) + ((1099511627775 ^ (x | -1099511624449)) * -240212134403482096))))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 5881601438423093589) + (((((x & 1111) ^ -2223) * -7980724869601410460) + (((~x) | -1106) * 1969879376998569031)) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 1121755840066501658) + ((((1099511627775 ^ (-2223 + (x & 6))) * -549337684486946104) + (((x & 1111) ^ 2222) * -3095549074654021392)) + ((((x & 1111) ^ -2223) * -6605932645521107357) + (((1105 ^ (x & 1099511625553)) * 58573718041639173) + (((x & 1105) * -6745735451040581159) + -4821700281647061510))))))))) * ((((((1099511627775 ^ (-2223 + (x & 6))) * 7983231184792449384) + ((((x & 1111) ^ 2222) * 2000148955279027632) + (((1105 ^ (x & 1099511625553)) * 3392087217430443721) + ((1099511625553 & (x ^ -1112)) * 3528000921577288962)))) + (((((x & 1105) * 7661875297362417069) + ((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 6983004516024388441)) + (((x ^ -1112) + (((1111 & (~x)) * 2) + (x + -2694360946117271215))) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 4269788079931973346) + ((((~x) | -1106) * 2527774252809228019) + (((x & 1111) ^ -2223) * 6258160761835117939))))) + (((1099511627775 ^ (x | -1099511624449)) * -2849130140239260336) + (((x & 1111) ^ 2222) * -3725219378236359078)))) * (((((x & 1105) * -4779242736425369600) + ((((((x & 1111) ^ 1099511625553) * 3712303880776712192) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 9165385062768705536) + ((((~x) | -1106) * 5251722880248446976) + (((1111 & (~x)) * -7035179078210551808) + ((x * -3517589539105275904) + -2667765680463413248))))) + ((((1099511625553 & (x ^ -1112)) * 7668732306793693184) + ((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -3003122535878361088)) + ((((x & 1111) ^ -2223) * 202670970450739200) + (((((x & 1111) ^ 2222) * -4149830098981224448) + ((1105 ^ (x & 1099511625553)) * 5259058877663543296)) + -1176883880917991424)))) + ((1099511627775 ^ (-2223 + (x & 6))) * -6864349584395599872))) * 8207399498670931968) + ((((1099511627775 ^ (x | -1099511624449)) * 4775745522797379584) + ((((-8134388765490675712 + (x * 3178634119571570688)) + (((1111 & (~x)) * 6357268239143141376) + (((x ^ 1111) * -3178634119571570688) + ((((x & 1111) ^ 2222) * -893924771815751680) + ((1105 ^ (x & 1099511625553)) * -3408590482530369536))))) + ((((~x) | -1106) * -7085496557113442304) + (((1099511627775 ^ (-2223 + (x & 6))) * 8469424406744006656) + ((((x & 1111) ^ 1099511625553) * -1566429892029972480) + (((x & 1111) ^ -2223) * 2723340888678858752))))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 9025478927610544128) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -8878480218751238144) + ((((x & 1111) ^ 2222) * 8849521315858612224) + (-4814714431088885760 + (((x & 1105) * -5929802462138466304) + ((1099511625553 & (x ^ -1112)) * -7641551077979979776)))))))) * (((8207399498670931968 * (((((x & 1111) ^ 2222) * 2000148955279027632) + (((~x) | -1106) * 2527774252809228019)) + ((((1099511627775 ^ (-2223 + (x & 6))) * 7983231184792449384) + (x + 7458885672204499881)) + ((((1099511625553 & (x ^ -1112)) * 3528000921577288962) + 8293497455387780519) + (((1099511627775 ^ (x | -1099511624449)) * -2849130140239260336) + ((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 6983004516024388441)))))) + ((x & 1105) * -3399359910616498176)) + ((((x ^ 1111) * -8207399498670931968) + (((x & 1111) ^ -2223) * -808080968412823552)) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 2817543866670907392) + (((1105 ^ (x & 1099511625553)) * -4184958700919717888) + ((((x & 1111) ^ 2222) * 8750472463705440256) + ((((x & 1111) ^ -2223) * 4695693860750229504) + ((1111 & (~x)) * -2031945076367687680)))))))))) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -3238196605773414400) + (((((x & 1111) ^ 2222) * -3160528616215805952) + ((((x & 1111) ^ 1099511625553) * 1412375393716928512) + (((1099511627775 ^ (-2223 + (x & 6))) * -3831771771959246848) + (((~x) | -1106) * -2916204436600651776)))) + ((((1099511627775 ^ (x | -1099511624449)) * 8225382440839938048) + ((((x & 1111) ^ 2222) * 176157430810411008) + ((((x & 1111) ^ -2223) * -8153651040978206720) + -8901248287063932928))) + ((((1111 & (~x)) * 149734620206727168) + (((1105 ^ (x & 1099511625553)) * 4715602838053453824) + (((x ^ 1111) * -74867310103363584) + ((9056138843710816256 + (x * 74867310103363584)) + ((x & 1105) * 1627140852486766592))))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 1738966201553387520) + ((1099511625553 & (x ^ -1112)) * -8486942410113286144)))))))) + ((((((((1099511627775 ^ (-2223 + (x & 6))) * 7983231184792449384) + ((((x & 1111) ^ 2222) * 2000148955279027632) + (((1105 ^ (x & 1099511625553)) * 3392087217430443721) + ((1099511625553 & (x ^ -1112)) * 3528000921577288962)))) + (((((x & 1105) * 7661875297362417069) + ((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 6983004516024388441)) + (((x ^ -1112) + (((1111 & (~x)) * 2) + (x + -2694360946117271215))) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 4269788079931973346) + ((((~x) | -1106) * 2527774252809228019) + (((x & 1111) ^ -2223) * 6258160761835117939))))) + (((1099511627775 ^ (x | -1099511624449)) * -2849130140239260336) + (((x & 1111) ^ 2222) * -3725219378236359078)))) * (((1099511627775 ^ (x | -1099511624449)) * 4775745522797379584) + ((((-8134388765490675712 + (x * 3178634119571570688)) + (((1111 & (~x)) * 6357268239143141376) + (((x ^ 1111) * -3178634119571570688) + ((((x & 1111) ^ 2222) * -893924771815751680) + ((1105 ^ (x & 1099511625553)) * -3408590482530369536))))) + ((((~x) | -1106) * -7085496557113442304) + (((1099511627775 ^ (-2223 + (x & 6))) * 8469424406744006656) + ((((x & 1111) ^ 1099511625553) * -1566429892029972480) + (((x & 1111) ^ -2223) * 2723340888678858752))))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 9025478927610544128) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -8878480218751238144) + ((((x & 1111) ^ 2222) * 8849521315858612224) + (-4814714431088885760 + (((x & 1105) * -5929802462138466304) + ((1099511625553 & (x ^ -1112)) * -7641551077979979776))))))))) + (((((x & 1105) * -4779242736425369600) + (((x & 1111) ^ 1099511625553) * 3712303880776712192)) + (((((1099511627775 ^ (x | -1099511624449)) * 3868563045932335104) + (((x & 1111) ^ -2223) * 202670970450739200)) + (((x & 1111) ^ 2222) * 191601892688658432)) + ((((1111 & (~x)) * -7035179078210551808) + (((x ^ 1111) * 3517589539105275904) + ((1099511625553 & (x ^ -1112)) * 7668732306793693184))) + ((1105 ^ (x & 1099511625553)) * 5259058877663543296)))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 9165385062768705536) + (((1099511627775 ^ (-2223 + (x & 6))) * -6864349584395599872) + ((((x * -3517589539105275904) + -3844649561381404672) + ((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -3003122535878361088)) + ((((x & 1111) ^ 2222) * -4341431991669882880) + (((~x) | -1106) * 5251722880248446976))))))) * ((((((x & 1111) ^ 2222) * -3725219378236359078) + (((1099511627775 ^ (x | -1099511624449)) * -2849130140239260336) + ((((1099511627775 ^ (-2223 + (x & 6))) * 7983231184792449384) + ((((x & 1111) ^ 2222) * 2000148955279027632) + (((1105 ^ (x & 1099511625553)) * 3392087217430443721) + ((1099511625553 & (x ^ -1112)) * 3528000921577288962)))) + ((((x & 1105) * 7661875297362417069) + ((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 6983004516024388441)) + ((x ^ -1112) + (((1111 & (~x)) * 2) + ((((x & 1111) ^ -2223) * 6258160761835117939) + ((x + -2694360946117271215) + (((~x) | -1106) * 2527774252809228019))))))))) * 1647925859236970496) + ((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 5641486809411092480))) + (((1099511625553 & (x ^ -1112)) * -8937980217473892352) + (((((x & 1111) ^ 2222) * 1155007540157743104) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * -8832899481037963264) + ((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 3890856954150518784))) + ((((x & 1111) ^ 1099511625553) * 1294271189010612224) + (((((((x & 1111) ^ -2223) * -4046885640623620096) + ((((~x) | -1106) * 7975024457091645440) + ((1111 & (~x)) * 6783076180246396928))) + (((x & 1105) * -445861506333016064) + (((x ^ 1111) * -3391538090123198464) + -2423939384194629632))) + ((1099511627775 ^ (x | -1099511624449)) * -7904802061777108992)) + (((1099511627775 ^ (-2223 + (x & 6))) * -7299160081893949440) + ((-4863027090124963840 + (x * 3391538090123198464)) + ((1105 ^ (x & 1099511625553)) * 7326949432979619840)))))))))) + ((((((1099511627775 ^ (-2223 + (x & 6))) * 7983231184792449384) + ((((x & 1111) ^ 2222) * 2000148955279027632) + (((1105 ^ (x & 1099511625553)) * 3392087217430443721) + ((1099511625553 & (x ^ -1112)) * 3528000921577288962)))) + (((((x & 1105) * 7661875297362417069) + ((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 6983004516024388441)) + (((x ^ -1112) + (((1111 & (~x)) * 2) + (x + -2694360946117271215))) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 4269788079931973346) + ((((~x) | -1106) * 2527774252809228019) + (((x & 1111) ^ -2223) * 6258160761835117939))))) + (((1099511627775 ^ (x | -1099511624449)) * -2849130140239260336) + (((x & 1111) ^ 2222) * -3725219378236359078)))) * ((-8192227374457937419 * ((((((1099511627775 ^ (-2223 + (x & 6))) * 7983231184792449384) + ((((x & 1111) ^ 2222) * 2000148955279027632) + (((1105 ^ (x & 1099511625553)) * 3392087217430443721) + ((1099511625553 & (x ^ -1112)) * 3528000921577288962)))) + (((((x & 1105) * 7661875297362417069) + ((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 6983004516024388441)) + (((x ^ -1112) + (((1111 & (~x)) * 2) + (x + -2694360946117271215))) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * 4269788079931973346) + ((((~x) | -1106) * 2527774252809228019) + (((x & 1111) ^ -2223) * 6258160761835117939))))) + (((1099511627775 ^ (x | -1099511624449)) * -2849130140239260336) + (((x & 1111) ^ 2222) * -3725219378236359078)))) * (((1099511627775 ^ (x | -1099511624449)) * 4775745522797379584) + ((((-8134388765490675712 + (x * 3178634119571570688)) + (((1111 & (~x)) * 6357268239143141376) + (((x ^ 1111) * -3178634119571570688) + ((((x & 1111) ^ 2222) * -893924771815751680) + ((1105 ^ (x & 1099511625553)) * -3408590482530369536))))) + ((((~x) | -1106) * -7085496557113442304) + (((1099511627775 ^ (-2223 + (x & 6))) * 8469424406744006656) + ((((x & 1111) ^ 1099511625553) * -1566429892029972480) + (((x & 1111) ^ -2223) * 2723340888678858752))))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * 9025478927610544128) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -8878480218751238144) + ((((x & 1111) ^ 2222) * 8849521315858612224) + (-4814714431088885760 + (((x & 1105) * -5929802462138466304) + ((1099511625553 & (x ^ -1112)) * -7641551077979979776))))))))) + (((((1099511627775 ^ (x | -1099511624449)) * 3868563045932335104) + (((x & 1111) ^ -2223) * 202670970450739200)) + (((x & 1111) ^ 2222) * 191601892688658432)) + ((((x & 1105) * -4779242736425369600) + (((x & 1111) ^ 1099511625553) * 3712303880776712192)) + (((1099511627775 ^ (-2223 + (x & 6))) * -6864349584395599872) + ((((x * -3517589539105275904) + -3844649561381404672) + ((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -3003122535878361088)) + ((((x & 1111) ^ 2222) * -4341431991669882880) + (((~x) | -1106) * 5251722880248446976)))))))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * -5800814108076933120) + (((1105 ^ (x & 1099511625553)) * 6590194475350360064) + ((((1099511625553 & (x ^ -1112)) * -2320826522316832768) + ((1111 & (~x)) * -4635772938052698112)) + ((x ^ 1111) * 2317886469026349056)))))) + ((((((1111 & (~x)) * 6287540243956498434) + (((1105 ^ (x & 1099511625553)) * 6962876766232098505) + ((x ^ 1111) * -3143770121978249217))) + (((1099511627775 ^ ((x ^ -1112) | -1099511625554)) * -6509394104226750750) + (((1099511625553 & (x ^ -1112)) * 8492196458133288194) + (((x & 1111) ^ 2222) * 6531678479032909402)))) + (((1099511627775 ^ (-2223 + (x & 6))) * -3940856935357615768) + ((((~x) | -1106) * 9124040821926170355) + ((((x & 1111) ^ -2223) * -7469435091286594124) + ((x & 1105) * 6741022905961846189))))) + (((1099511627775 ^ (-1099511625554 | (x ^ 1111))) * -3309012571564733607) + (((1099511627775 ^ (x | -1099511624449)) * -4729701224563206832) + (((x * 3143770121978249217) + -3707191039266741936) + ((((x & 1111) ^ 2222) * 4179451851311574448) + (((x & 1111) ^ -2223) * -1063265465457840193)))))))),
+      # - 7 * (~(x ^ y) | ~(x ^ z)) + 2 * (x ^ y & z) - 1 * ~(x & (~y | z)) + 1 * ((x | y) & ~(x ^ (y ^ z))) - 7 * (x | ~y & z) - 6 * (y & ~(x & z)) + 7 * (y & (x ^ z)) - 3 * (~z & (x ^ y)) + 4 * ~z - 7 * (z ^ ~(x | ~y)) - 7 * ~(x | ~y & z) - 1 * (y ^ (x | (~y | z))) - 2 * (~x & (~y | z)) - 3 * (y ^ ~(x | z)) - 11 * (y | x & ~z) + 11 * (z ^ (x | ~y & z)) + 17 * ~(x | (y | z)) + 50 * ~(x | (~y | z)) + 5 * ~(~x | (y | z)) + 10 * ~(~x | (~y | z)) + 25 * (~x & (~y & z)) + 20 * (~x & (y & z)) + 30 * (x & (~y & z)) + (x & y) * (x | y) + (x & ~y) * (~x & y),
+      # -7*~((x^y)&(x^z))+2*(x^y&z)-~(x&(~y|z))+((x|y)&~(x^y^z))-7*(x|~y&z)-6*(y&~(x&z))+7*(y&(x^z))-3*(~z&(x^y))-4-4*z-7*(z^~(x|~y))-7*~(x|~y&z)-~(y&(x|z))-2*~(x|y&~z)-3*~(y^(x|z))-11*(y|x&~z)+11*(z^(x|~y&z))+17*~(x|y|z)+50*~(x|~y|z)+5*~(~x|y|z)+10*(x&y&~z)+25*~(x|y|~z)+20*(~x&y&z)+30*(x&~y&z),
+      expression,
+      # x * y + 11 * (y ^ x & (y ^ z)) - 46 * (x & (y & z))
+      None
+    )
+  ]
+
+  # s = 64
+  # x = KnownBits.makeVariable(s)
+  # a = KnownBits.makeConstant(s, 0xe62472b3af6bad9c)
+  # b = KnownBits.makeConstant(s, 0x99db8d4c50945260)
+  # c = KnownBits.makeConstant(s, 0x19db8d4c50945260)
+  # d = KnownBits.makeConstant(s, 0x2)
+  # e = KnownBits.makeConstant(s, 0x4)
+  # kb0 = ((x&c)^((x&a)^b))
+  # kb1 = ((x&c)^((x&a)+b))
+  # print(f"kb0: {kb0}")
+  # print(f"kb1: {kb1}")
+  # kb2 = x&d
+  # kb3 = x&e
+  # print(f"kb2: {kb2}")
+  # print(f"kb3: {kb3}")
+  # print(f"kb2.getMinValue(): {kb2.getMinValue()}, kb2.getMaxValue(): {kb2.getMaxValue()}")
+  # print(f"kb3.getMinValue(): {kb3.getMinValue()}, kb3.getMaxValue(): {kb3.getMaxValue()}")
+  # exit(1)
+
+  # s = 64
+  # x = KnownBits.makeVariable(s)
+  # v5 = (((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((x^0x3FB27BEF)+686588744)^0x3FB27BEF)+607396168)^0x3FB27BEF)+1220555080)^0x3FB27BEF)-146276352)^0x3FB27BEF)-1055864383)^0x3FB27BEF)-1991505684)^0x3FB27BEF)+1753110293)^0x3FB27BEF)+122395974)^0x3FB27BEF)+1090684159)^0x3FB27BEF)+1103792449)^0x3FB27BEF)-146735104)^0x3FB27BEF)+1140850903)^0x3FB27BEF)+605326156)^0x3FB27BEF)-1903343535)^0x3FB27BEF)-1584708506)^0x3FB27BEF)+21259865)^0x3FB27BEF)+1069180612)^0x3FB27BEF)+1097255961)^0x3FB27BEF)+24684169)^0x3FB27BEF)+1727603748)^0x3FB27BEF)+1711809636)^0x3FB27BEF)-1989801720)^0x3FB27BEF)-146254080)^0x3FB27BEF)-0x10000)^0x3FB27BEF)+1026778719)^0x3FB27BEF)-1081252249)^0x3FB27BEF)+1733409638)^0x3FB27BEF)+143476989)^0x3FB27BEF)+1207959552)^0x3FB27BEF)-2125937758)^0x3FB27BEF)+1586063010)^0x3FB27BEF)-1638780068)^0x3FB27BEF)-1958161879)^0x3FB27BEF)-97957888)^0x3FB27BEF)+1222309704)^0x3FB27BEF)-819902255)^0x3FB27BEF)+1104621896)^0x3FB27BEF)+1484958213)^0x3FB27BEF)+266895681)^0x3FB27BEF)+21551351)^0x3FB27BEF)-1958193087)^0x3FB27BEF)-821999616)^0x3FB27BEF)-1991714313)^0x3FB27BEF)+1686980608)^0x3FB27BEF)-146267116)^0x3FB27BEF)-504790712)^0x3FB27BEF)+1512313889)^0x3FB27BEF)+1220780559)^0x3FB27BEF)+1101139847)^0x3FB27BEF)+860156809)^0x3FB27BEF)-1223998371)^0x3FB27BEF)+1172754753)^0x3FB27BEF)+1154560497)^0x3FB27BEF)-146188735)^0x3FB27BEF)+1096696100)^0x3FB27BEF)-2126405105)^0x3FB27BEF)+2123064994)^0x3FB27BEF)+610569544)^0x3FB27BEF)+1006724644)^0x3FB27BEF)-821991900)^0x3FB27BEF)+2122933768)^0x3FB27BEF)+1082877647)^0x3FB27BEF)-148630281)^0x3FB27BEF)+588302529
+  # v6 = ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((v5^0x3FB27BEF)+567408400)^0x3FB27BEF)-1924611166)^0x3FB27BEF)-1081251903)^0x3FB27BEF)-1924607497)^0x3FB27BEF)+1092881545)^0x3FB27BEF)-2125920220)^0x3FB27BEF)-1903607377)^0x3FB27BEF)+1380015681)^0x3FB27BEF)+1106839816)^0x3FB27BEF)+1213422145)^0x3FB27BEF)-1924619761)^0x3FB27BEF)-256330613)^0x3FB27BEF)+1711809636)^0x3FB27BEF)+1711276032)^0x3FB27BEF)+1724776769)^0x3FB27BEF)+1392508928)^0x3FB27BEF)+13336904)^0x3FB27BEF)+1219625407)^0x3FB27BEF)+1374912870)^0x3FB27BEF)-1989796134)^0x3FB27BEF)+227231744)^0x3FB27BEF)-910611610)^0x3FB27BEF)-625571004)^0x3FB27BEF)+1727473988)^0x3FB27BEF)-625571516)^0x3FB27BEF)+257209997)^0x3FB27BEF)-989591610)^0x3FB27BEF)+1542357321)^0x3FB27BEF)-2125926143)^0x3FB27BEF)-1048491870)^0x3FB27BEF)+282116424)^0x3FB27BEF)-1)^0x3FB27BEF)+558387440)^0x3FB27BEF)+1213612504)^0x3FB27BEF)+692635903)^0x3FB27BEF)+1686980644)^0x3FB27BEF)-1991760844)^0x3FB27BEF)+337725650)^0x3FB27BEF)-1778169616)^0x3FB27BEF)-1014968)^0x3FB27BEF)-1991720447)^0x3FB27BEF)+485969920)^0x3FB27BEF)-1924607447)^0x3FB27BEF)+11175563)^0x3FB27BEF)+63638)^0x3FB27BEF)+334)^0x3FB27BEF)+1874839239)^0x3FB27BEF)-593227967)^0x3FB27BEF)-1542503408)^0x3FB27BEF)+657793868)^0x3FB27BEF)-1043904175)^0x3FB27BEF)-924221111)^0x3FB27BEF)-146223319)^0x3FB27BEF)+49344385)^0x3FB27BEF)+1238862153)^0x3FB27BEF)-265204486)^0x3FB27BEF)+1598159409)^0x3FB27BEF)+152221834)^0x3FB27BEF)+1220780493)^0x3FB27BEF)+1447150498)^0x3FB27BEF)+1277435127)^0x3FB27BEF
+  # expression = ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((v6+136602765)^0x3FB27BEF)+495798355)^0x3FB27BEF)-736296120)^0x3FB27BEF)-1957864645)^0x3FB27BEF)-1924599415)^0x3FB27BEF)+1797564063)^0x3FB27BEF)+1290980291)^0x3FB27BEF)-2125898253)^0x3FB27BEF)-1098169917)^0x3FB27BEF)+1586689921)^0x3FB27BEF)+225629464)^0x3FB27BEF)+914896267)^0x3FB27BEF)-1279740275)^0x3FB27BEF)-147766025)^0x3FB27BEF)+1240936772)^0x3FB27BEF)+558628864)^0x3FB27BEF)+0xFFFFFF)^0x3FB27BEF)-1102449887)^0x3FB27BEF)-1)^0x3FB27BEF)-1010743280)^0x3FB27BEF)+1686980656)^0x3FB27BEF)+80169202)^0x3FB27BEF)+338249983)^0x3FB27BEF)+1686980644)^0x3FB27BEF)-64)^0x3FB27BEF)+1230324004)^0x3FB27BEF)-2125870491)^0x3FB27BEF)-292991738)^0x3FB27BEF)+591930372)^0x3FB27BEF)-1453440715)^0x3FB27BEF)+615812428)^0x3FB27BEF)+1221626184)^0x3FB27BEF)+1470406566)^0x3FB27BEF)-634828584)^0x3FB27BEF)+1287898952)^0x3FB27BEF)+1210319915)^0x3FB27BEF)-2125938175)^0x3FB27BEF)+209799228)^0x3FB27BEF)+469977148)^0x3FB27BEF)+605325640)^0x3FB27BEF)+1224343880)^0x3FB27BEF)+136602765)^0x3FB27BEF)+1342177281)^0x3FB27BEF)-783757279)^0x3FB27BEF)+67323940)^0x3FB27BEF)-1991768028)^0x3FB27BEF)+495667200)^0x3FB27BEF)+147571016)^0x3FB27BEF)-906788536)^0x3FB27BEF)+1280827273)^0x3FB27BEF)+692846592)^0x3FB27BEF)-1867085492)^0x3FB27BEF)+1210324109)^0x3FB27BEF)-951475697)^0x3FB27BEF)-0x368A1DB7B72B777
+  # print(f"expression: {(((x^0x3FB27BEF)+686588744)^0x3FB27BEF)}")
+  # exit(1)
+
   times = []
 
   oracle = None
@@ -41400,12 +41976,13 @@ if __name__ == '__main__':
         if args.use_qsynth_inside:
           cost_functions.append(NodeQSynthWeight(egraph, oracle, args.bits, args.verify, args.inject_into_e_graph))
         # Extract the best node and its cost
+        print("[DEBUG] Extracting the best expression from the e-graph...")
         extractor = Extractor(egraph, node, cost_functions, symbols, args.use_constants_harvest)
         # Track if we need to update the e-graph
         egraph_changed = False
         # Enrich the e-graph (union of synthesized e-classes)
+        print("[DEBUG] Enriching the e-graph (union of synthesized e-classes)...")
         for cost_function in cost_functions:
-          # print(f"(injectable) cost_function: {cost_function}")
           # Inject the synthesized knowledge into the e-graph
           injectable = cost_function.get_injectable()
           if args.inject_into_e_graph and injectable:
@@ -41458,6 +42035,7 @@ if __name__ == '__main__':
             #       assert b_size_0 == b_real_0, f"b_size_0: {b_size_0}, b_real_0: {b_real_0}, b_node_0: {b_node_0.to_exp()}, old_eclass_id: {old_eclass_id}, new_eclass_id: {new_eclass_id}"
             #       assert b_size_0 <= upper_bound_size, f"b_size_0: {b_size_0}, upper_bound_size: {upper_bound_size}, old_eclass_id: {old_eclass_id}, new_eclass_id: {new_eclass_id}"
         # Enrich the e-graph (union of equivalent e-classes)
+        print("[DEBUG] Enriching the e-graph (union of equivalent e-classes)...")
         for cost_function in cost_functions:
           # print(f"(equivalence) cost_function: {cost_function}")
           # Inject the equivalence knowledge into the e-graph
@@ -41490,7 +42068,7 @@ if __name__ == '__main__':
           if args.use_constants_harvest_heavy:
             print(f'Subtrees: {len(eclass_expressions)}, E-Graph: {len(egraph.eclasses())}')
           if len(eclass_expressions) <= args.constants_harvest_limit:
-            update_oracle_with_harvested_constants(oracle, harvested_constants, eclass_expressions, mask, args.bits, constants_computation_cache, args.use_constants_harvest_negate, args.use_constants_harvest_heavy)
+            update_oracle_with_harvested_constants(oracle, harvested_constants, eclass_expressions, mask, args.bits, constants_computation_cache, args.use_constants_harvest_negate, args.use_constants_harvest_heavy, args.verify)
         # Extract the synthesized node
         synt_cost, synt_node = extractor.find_best(node)
         # Update the original cost
